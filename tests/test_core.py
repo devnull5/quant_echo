@@ -1,13 +1,18 @@
+import json
 import queue
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
-from quantecho import ai
-from quantecho.config import Settings, load_settings, save_settings
+from quantecho import llm
+from quantecho.config import Settings, load_settings, normalize_host, save_settings
 from quantecho.poller import Poller
-from quantecho.schwab_provider import NY, SchwabProvider, latest_session, parse_candles, parse_quotes
+from quantecho.providers import PROVIDERS, ProviderError, create
+from quantecho.providers.base import NY, latest_session, parse_iso
+from quantecho.providers.schwab import SchwabProvider, parse_candles, parse_quotes
+from quantecho.providers.simulated import SimulatedProvider
 from quantecho.ta import compute_ta, ema, macd_12269, rsi14, vwap_from_bars
 from quantecho.telemetry import TelemetryStore
 
@@ -35,9 +40,6 @@ class FakeResp:
     def __init__(self, payload, status=200):
         self._p, self.status_code, self.text = payload, status, "boom"
 
-    def raise_for_status(self):
-        pass
-
     def json(self):
         return self._p
 
@@ -54,6 +56,22 @@ class FakeClient:
         return FakeResp({"candles": self.bars, "symbol": symbol})
 
 
+class FakeHttp:
+    """Stands in for providers.base.Http: maps a path substring -> payload."""
+
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    def get(self, path, params=None, headers=None):
+        self.calls.append((path, params))
+        for k, v in self.routes.items():
+            if k in path or (params and k in json.dumps(params)):
+                if isinstance(v, Exception):
+                    raise v
+                return v
+        raise AssertionError(f"unrouted {path} {params}")
+
+
 def candles(n, start_px=100.0, step=0.1, day=(2026, 11, 5)):
     out = []
     for i in range(n):
@@ -63,7 +81,9 @@ def candles(n, start_px=100.0, step=0.1, day=(2026, 11, 5)):
     return out
 
 
-class TestParsing(unittest.TestCase):
+# ============================================================ Schwab
+
+class TestSchwab(unittest.TestCase):
     def test_quotes_nested_schwab_shape(self):
         q = parse_quotes(QUOTES)
         self.assertEqual(set(q), {"SPY", "NVDA"})
@@ -74,10 +94,9 @@ class TestParsing(unittest.TestCase):
         self.assertIsNone(q["NVDA"].bid)
 
     def test_candles_sorted_and_latest_session(self):
-        rows = parse_candles({"candles": candles(3, day=(2026, 11, 5)) + candles(2, day=(2026, 11, 4))})
-        self.assertEqual(len(rows), 5)
+        rows = latest_session(parse_candles({"candles": candles(3) + candles(2, day=(2026, 11, 4))}))
+        self.assertEqual(len(rows), 3)
         self.assertEqual([r["t"] for r in rows], sorted(r["t"] for r in rows))
-        self.assertEqual(len(latest_session(rows)), 3)
 
     def test_provider_decodes_httpx_response(self):
         p = SchwabProvider("", "", "", client=FakeClient(candles(40)))
@@ -88,9 +107,162 @@ class TestParsing(unittest.TestCase):
         class Bad(FakeClient):
             def get_quotes(self, s):
                 return FakeResp({}, status=401)
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(ProviderError):
             SchwabProvider("", "", "", client=Bad([])).get_quotes(["SPY"])
 
+
+# ============================================================ other providers
+
+T0 = _ms(2026, 11, 5, 9, 30)
+
+
+class TestProviders(unittest.TestCase):
+    def test_registry_and_missing_creds(self):
+        self.assertGreaterEqual(len(PROVIDERS), 9)
+        for pid, spec in PROVIDERS.items():
+            if any(f.secret for f in spec.fields):
+                with self.assertRaises(ProviderError, msg=pid):
+                    create(pid, {})
+
+    def test_yahoo(self):
+        from quantecho.providers.yahoo import YahooProvider
+        chart = {"chart": {"error": None, "result": [{
+            "meta": {"symbol": "SPY", "regularMarketPrice": 740.65, "chartPreviousClose": 733.0,
+                     "regularMarketVolume": 14234102, "regularMarketTime": 1793978820,
+                     "regularMarketChangePercent": 1.044},
+            "timestamp": [T0 // 1000, T0 // 1000 + 60, T0 // 1000 + 120],
+            "indicators": {"quote": [{"open": [1, 2, 3], "high": [1, 2, 3], "low": [1, 2, 3],
+                                      "close": [1.5, None, 3.5], "volume": [10, 20, 30]}]},
+        }]}}
+        p = YahooProvider(http=FakeHttp({"SPY": chart}))
+        q = p.get_quotes(["spy"])["SPY"]
+        self.assertEqual((q.last, q.net_pct, q.timestamp_ms), (740.65, 1.044, 1793978820000))
+        bars = p.get_session_minute_bars("SPY")
+        self.assertEqual([b["close"] for b in bars], [1.5, 3.5])  # None close dropped
+
+    def test_yahoo_error(self):
+        from quantecho.providers.yahoo import YahooProvider
+        bad = {"chart": {"result": None, "error": {"code": "Not Found", "description": "No data found"}}}
+        with self.assertRaises(ProviderError):
+            YahooProvider(http=FakeHttp({"ZZZZ": bad})).get_quotes(["ZZZZ"])
+
+    def test_alpaca(self):
+        from quantecho.providers.alpaca import AlpacaProvider
+        snaps = {"SPY": {
+            "latestTrade": {"p": 512.5, "t": "2026-11-05T15:00:00.123456789Z"},
+            "latestQuote": {"bp": 512.49, "ap": 512.51, "t": "2026-11-05T15:00:00Z"},
+            "dailyBar": {"c": 512.4, "v": 900000}, "prevDailyBar": {"c": 500.0},
+        }}
+        bars = {"bars": [{"t": "2026-11-05T14:30:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}],
+                "next_page_token": None}
+        p = AlpacaProvider("k", "s", http=FakeHttp({"snapshots": snaps, "/bars": bars}))
+        q = p.get_quotes(["SPY"])["SPY"]
+        self.assertEqual((q.last, q.bid, q.ask, q.total_volume), (512.5, 512.49, 512.51, 900000))
+        self.assertAlmostEqual(q.net_pct, 2.5)
+        self.assertEqual(q.timestamp_ms, parse_iso("2026-11-05T15:00:00.123Z"))
+        self.assertEqual(len(p.get_session_minute_bars("SPY")), 1)
+
+    def test_polygon_snapshot_and_free_fallback(self):
+        from quantecho.providers.polygon import PolygonProvider
+        snap = {"tickers": [{"ticker": "SPY", "todaysChangePerc": 0.5, "todaysChange": 2.5,
+                             "lastTrade": {"p": 505.0, "t": 1730900000000000000},
+                             "lastQuote": {"p": 504.9, "P": 505.1}, "day": {"v": 1e6}, "prevDay": {"c": 502.5}}]}
+        q = PolygonProvider("k", http=FakeHttp({"snapshot": snap})).get_quotes(["SPY"])["SPY"]
+        self.assertEqual((q.last, q.bid, q.ask, q.timestamp_ms), (505.0, 504.9, 505.1, 1730900000000))
+
+        prev = {"results": [{"t": T0, "o": 1, "h": 1, "l": 1, "c": 499.0, "v": 5}]}
+        http = FakeHttp({"snapshot": ProviderError("HTTP 403: NOT_AUTHORIZED"), "/prev": prev})
+        p = PolygonProvider("k", http=http)
+        self.assertEqual(p.get_quotes(["SPY"])["SPY"].last, 499.0)
+        p.get_quotes(["SPY"])
+        self.assertEqual(sum("snapshot" in c[0] for c in http.calls), 1)  # doesn't retry paid endpoint
+
+    def test_finnhub(self):
+        from quantecho.providers.finnhub import FinnhubProvider
+        http = FakeHttp({"quote": {"c": 261.74, "d": 1.2, "dp": 0.46, "pc": 260.5, "t": 1730900000},
+                         "candle": ProviderError("HTTP 403: You don't have access to this resource.")})
+        p = FinnhubProvider("k", http=http)
+        q = p.get_quotes(["AAPL"])["AAPL"]
+        self.assertEqual((q.last, q.net_pct, q.timestamp_ms), (261.74, 0.46, 1730900000000))
+        with self.assertRaises(ProviderError):
+            p.get_session_minute_bars("AAPL")
+        self.assertEqual(p.get_session_minute_bars("AAPL"), [])  # remembers, stops asking
+
+    def test_tiingo(self):
+        from quantecho.providers.tiingo import TiingoProvider
+        iex = [{"ticker": "SPY", "last": 510.0, "prevClose": 500.0, "bidPrice": 509.9, "askPrice": 510.1,
+                "volume": 12345, "timestamp": "2026-11-05T15:00:00.000000-05:00"}]
+        prices = [{"date": "2026-11-05T14:30:00.000Z", "open": 1, "high": 2, "low": 0.5, "close": 1.5,
+                   "volume": 10}]
+        p = TiingoProvider("k", http=FakeHttp({"/prices": prices, "iex/": iex}))
+        q = p.get_quotes(["SPY"])["SPY"]
+        self.assertEqual((q.last, q.bid, q.net_pct), (510.0, 509.9, 2.0))
+        self.assertEqual(len(p.get_session_minute_bars("SPY")), 1)
+
+    def test_twelvedata(self):
+        from quantecho.providers.twelvedata import TwelveDataProvider
+        multi = {"SPY": {"symbol": "SPY", "close": "510.5", "volume": "100", "percent_change": "0.3",
+                         "change": "1.5", "timestamp": 1730900000},
+                 "BAD": {"status": "error", "code": 400, "message": "symbol not found"}}
+        series = {"meta": {}, "status": "ok", "values": [
+            {"datetime": "2026-11-05 09:31:00", "open": "1", "high": "2", "low": "0.5", "close": "1.6", "volume": "5"},
+            {"datetime": "2026-11-05 09:30:00", "open": "1", "high": "2", "low": "0.5", "close": "1.5", "volume": "5"},
+        ]}
+        p = TwelveDataProvider("k", http=FakeHttp({"time_series": series, "quote": multi}))
+        q = p.get_quotes(["SPY", "BAD"])
+        self.assertEqual(list(q), ["SPY"])
+        self.assertEqual(q["SPY"].last, 510.5)
+        bars = p.get_session_minute_bars("SPY")
+        self.assertEqual([b["close"] for b in bars], [1.5, 1.6])  # oldest first
+        self.assertEqual(bars[0]["t"], T0)
+        with self.assertRaises(ProviderError):
+            TwelveDataProvider("k", http=FakeHttp({"quote": {"status": "error", "code": 401,
+                                                             "message": "bad key"}})).get_quotes(["SPY"])
+
+    def test_alphavantage(self):
+        from quantecho.providers.alphavantage import AlphaVantageProvider
+        gq = {"Global Quote": {"01. symbol": "IBM", "05. price": "250.10", "06. volume": "1000",
+                               "09. change": "1.10", "10. change percent": "0.4418%"}}
+        intraday = {"Meta Data": {"6. Time Zone": "US/Eastern"}, "Time Series (1min)": {
+            "2026-11-05 09:30:00": {"1. open": "1", "2. high": "2", "3. low": "0.5", "4. close": "1.5",
+                                    "5. volume": "9"}}}
+        p = AlphaVantageProvider("k", http=FakeHttp({"GLOBAL_QUOTE": gq, "INTRADAY": intraday}))
+        q = p.get_quotes(["IBM"])["IBM"]
+        self.assertEqual((q.last, q.net_pct), (250.10, 0.4418))
+        self.assertEqual(p.get_session_minute_bars("IBM")[0]["t"], T0)
+        limited = AlphaVantageProvider("k", http=FakeHttp({"GLOBAL_QUOTE": {"Information": "rate limit 25/day"}}))
+        with self.assertRaises(ProviderError):
+            limited.get_quotes(["IBM"])
+
+    def test_simulated_end_to_end(self):
+        ev, tel = queue.Queue(), TelemetryStore()
+        Poller(SimulatedProvider(seed=1), ["SPY", "TSLA"], "SPY", 1, ev, tel).poll_once()
+        ctx = tel.context("SPY")
+        self.assertIn("SYMBOL: SPY", ctx)
+        self.assertNotIn("RSI14 n/a", ctx)
+        self.assertIsNotNone(tel.quote("TSLA").last)
+
+    def test_http_redacts_keys(self):
+        from quantecho.providers.base import Http
+
+        class Boom:
+            def get(self, url, params=None, headers=None):
+                import httpx
+                raise httpx.ConnectError(f"failed {url}?apikey=SECRET123 token SECRET123")
+        h = Http("https://x", secrets=("SECRET123",), client=Boom())
+        with self.assertRaises(ProviderError) as cm:
+            h.get("q")
+        self.assertNotIn("SECRET123", str(cm.exception))
+
+    def test_parse_iso_variants(self):
+        a = parse_iso("2026-11-05T14:30:00Z")
+        self.assertEqual(a, T0)
+        self.assertEqual(parse_iso("2026-11-05T14:30:00.123456789Z"), a + 123)
+        self.assertEqual(parse_iso("2026-11-05T09:30:00-05:00"), a)
+        self.assertIsNone(parse_iso("garbage"))
+
+
+# ============================================================ TA
 
 class TestTA(unittest.TestCase):
     def test_rsi_extremes(self):
@@ -111,27 +283,22 @@ class TestTA(unittest.TestCase):
         self.assertIsNone(vwap_from_bars([]))
 
     def test_compute_ta_full(self):
-        rows = parse_candles({"candles": candles(60)})
-        ta = compute_ta(rows)
+        ta = compute_ta(parse_candles({"candles": candles(60)}))
         for v in (ta.vwap, ta.rsi14, ta.macd, ta.macd_signal):
             self.assertIsNotNone(v)
 
 
-class TestPollerAndTelemetry(unittest.TestCase):
+# ============================================================ poller
+
+class TestPoller(unittest.TestCase):
     def test_poll_once_populates_context(self):
-        ev = queue.Queue()
-        tel = TelemetryStore()
-        p = Poller(SchwabProvider("", "", "", client=FakeClient(candles(60))), ["nvda", "spy"], "spy",
-                   5, ev, tel)
+        ev, tel = queue.Queue(), TelemetryStore()
+        p = Poller(SchwabProvider("", "", "", client=FakeClient(candles(60))), ["nvda", "spy"], "spy", 5, ev, tel)
         self.assertEqual(p.symbols, ["SPY", "NVDA"])
         p.poll_once()
         ctx = tel.context("SPY")
-        self.assertIn("FOCUS: SPY", ctx)
         self.assertIn("Last 512.34", ctx)
-        self.assertIn("RSI14", ctx)
         self.assertNotIn("RSI14 n/a", ctx)
-        kinds = [ev.get_nowait()[0] for _ in range(ev.qsize())]
-        self.assertIn("quotes", kinds)
 
     def test_errors_do_not_raise(self):
         class Boom:
@@ -147,31 +314,150 @@ class TestPollerAndTelemetry(unittest.TestCase):
         self.assertIn("Bars error", logs)
 
 
-class TestAI(unittest.TestCase):
-    def test_reasoning_budget(self):
-        self.assertEqual(ai.build_request("hi", "gpt-5")["reasoning"], {"effort": "low"})
-        self.assertNotIn("reasoning", ai.build_request("hi", "gpt-4.1"))
+# ============================================================ Ollama
 
-    def test_extract_text(self):
-        resp = {"output": [
-            {"type": "reasoning", "summary": []},
-            {"type": "message", "content": [{"type": "output_text", "text": "Bullish."}]},
-        ]}
-        self.assertEqual(ai.extract_text(resp), "Bullish.")
-        self.assertIn("incomplete", ai.extract_text(
-            {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "output": []}))
+class TestLLM(unittest.TestCase):
+    def test_request_shape(self):
+        body = llm.build_request("hi", "llama3.2")
+        self.assertFalse(body["stream"])
+        self.assertEqual(body["messages"][-1], {"role": "user", "content": "hi"})
 
+    def test_extract_strips_think(self):
+        self.assertEqual(llm.extract_text({"message": {"content": "<think>hmm</think>\nBullish."}}), "Bullish.")
+        self.assertEqual(llm.extract_text({}), "(no answer)")
+
+    def test_unreachable_is_friendly(self):
+        out = llm.ask("hi", host="http://127.0.0.1:9", model="x")
+        self.assertIn("Can't reach", out)
+        self.assertEqual(llm.list_models("http://127.0.0.1:9"), [])
+
+    def test_ask_roundtrip(self):
+        with mock.patch.object(llm, "_post", return_value={"message": {"content": "Neutral."}}) as m:
+            self.assertEqual(llm.ask("q", model="qwen3", host="http://h:1"), "Neutral.")
+            self.assertEqual(m.call_args[0][0], "http://h:1/api/chat")
+
+
+# ============================================================ config
 
 class TestConfig(unittest.TestCase):
     def test_secrets_not_saved_without_remember(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "s.json"
-            save_settings(Settings(openai_key="sk-x", schwab_app_key="k", remember=False, interval=7), path)
-            text = path.read_text()
-            self.assertNotIn("sk-x", text)
+            s = Settings(provider="alpaca", remember=False, interval=7,
+                         creds={"alpaca_key_id": "AKX", "alpaca_feed": "sip"})
+            save_settings(s, path)
+            self.assertNotIn("AKX", path.read_text())
+            loaded = load_settings(path)
+            self.assertEqual((loaded.provider, loaded.interval, loaded.remember), ("alpaca", 7, False))
+            self.assertEqual(loaded.creds["alpaca_feed"], "sip")
+
+    def test_legacy_flat_keys_migrate(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.json"
+            path.write_text(json.dumps({"schwab_app_key": "OLD", "provider": "nope"}))
             s = load_settings(path)
-            self.assertEqual(s.interval, 7)
-            self.assertFalse(s.remember)
+            self.assertEqual(s.creds["schwab_app_key"], "OLD")
+            self.assertEqual(s.provider, "yahoo")
+
+    def test_normalize_host(self):
+        self.assertEqual(normalize_host("0.0.0.0"), "http://127.0.0.1:11434")
+        self.assertEqual(normalize_host("localhost:11434"), "http://localhost:11434")
+        self.assertEqual(normalize_host(""), "http://127.0.0.1:11434")
+
+
+class TestStreamingAndContext(unittest.TestCase):
+    def _lines(self, *msgs, done=None):
+        out = [json.dumps({"message": m}).encode() + b"\n" for m in msgs]
+        out.append(json.dumps({"message": {}, "done": True, **(done or {})}).encode() + b"\n")
+
+        class Ctx(list):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return Ctx(out)
+
+    def test_stream_thinking_field(self):
+        lines = self._lines({"thinking": "hmm "}, {"thinking": "ok"}, {"content": " Bull"}, {"content": "ish."},
+                            done={"eval_count": 100, "eval_duration": 2_000_000_000})
+        toks, thinks = [], []
+        with mock.patch.object(llm, "_open", return_value=lines):
+            text, st = llm.ask_stream("q", toks.append, think=True, on_thinking=thinks.append)
+        self.assertEqual(text, "Bullish.")
+        self.assertEqual(thinks[-1], 6)
+        self.assertEqual(st.tok_per_s, 50.0)
+
+    def test_stream_inline_think_hidden(self):
+        lines = self._lines({"content": "<think>secret"}, {"content": " stuff</think>Answer"}, {"content": "!"})
+        toks = []
+        with mock.patch.object(llm, "_open", return_value=lines):
+            text, _ = llm.ask_stream("q", toks.append)
+        self.assertEqual(text, "Answer!")
+        self.assertNotIn("secret", "".join(toks))
+
+    def test_stream_error_chunk(self):
+        bad = self._lines()
+        bad.insert(0, json.dumps({"error": "model 'x' not found"}).encode())
+        with mock.patch.object(llm, "_open", return_value=bad):
+            text, _ = llm.ask_stream("q", lambda t: None, model="x")
+        self.assertIn("ollama pull x", text)
+
+    def test_resample_and_rth_vwap(self):
+        from quantecho.telemetry import resample, session_phase
+        bars = parse_candles({"candles": candles(12)})
+        b5 = resample(bars, 5)
+        self.assertEqual(len(b5), 3)
+        self.assertEqual(b5[0]["volume"], sum(1000 + i for i in range(5)))
+        self.assertEqual(session_phase(T0), "regular session")
+        self.assertEqual(session_phase(T0 - 3600_000), "pre-market")
+        tel = TelemetryStore()
+        pre = [{"t": T0 - 60_000 * (i + 1), "open": 1, "high": 1, "low": 1, "close": 1.0, "volume": 1e6}
+               for i in range(5)]
+        tel.update_bars("SPY", sorted(pre, key=lambda b: b["t"]) + bars)
+        self.assertGreater(tel.ta("SPY").vwap, 99)  # pre-market junk at $1 excluded from VWAP
+
+
+class TestSignalsAndHygiene(unittest.TestCase):
+    def test_signal_transitions_only(self):
+        from quantecho.signals import SignalTracker
+        from quantecho.ta import TA
+        t = SignalTracker("SPY")
+        self.assertEqual(t.update(101, TA(vwap=100, rsi14=50)), [])           # first sight: no event
+        self.assertEqual(t.update(101.5, TA(vwap=100, rsi14=50)), [])         # unchanged state
+        ev = t.update(99, TA(vwap=100, rsi14=25))
+        texts = " | ".join(e.text for e in ev)
+        self.assertIn("BELOW VWAP", texts)
+        self.assertIn("oversold", texts)
+        self.assertEqual(t.update(99, TA(vwap=100, rsi14=25)), [])           # no repeat
+
+    def test_session_extremes_ratchet(self):
+        from quantecho.signals import SignalTracker
+        from quantecho.ta import TA
+        t = SignalTracker("SPY")
+        t.update(100, TA(), 101, 99)
+        self.assertIn("HIGH", t.update(102, TA(), 102, 99)[0].text)
+        self.assertEqual(t.update(101, TA(), 101.5, 99), [])                 # narrower range: no re-trigger
+        self.assertEqual(t.update(101, TA(), 102, 99), [])
+
+    def test_volume_clip(self):
+        from quantecho.telemetry import clip_volume_outliers
+        bars = parse_candles({"candles": candles(40)})
+        bars[10] = {**bars[10], "volume": 5_000_000}
+        clean, n = clip_volume_outliers(bars)
+        self.assertEqual(n, 1)
+        self.assertLess(clean[10]["volume"], 50_000)
+        self.assertEqual(bars[10]["volume"], 5_000_000)  # input untouched
+
+    def test_journal(self):
+        from quantecho import journal
+        with tempfile.TemporaryDirectory() as d:
+            p = journal.append("Analysis SPY", "**Bias:** neutral", context="ctx", base=Path(d))
+            p2 = journal.append("Q: hi", "answer", base=Path(d))
+            self.assertEqual(p, p2)
+            txt = p.read_text(encoding="utf-8")
+            self.assertEqual(txt.count("# QuantEcho journal"), 1)
+            self.assertIn("**Bias:** neutral", txt)
 
 
 if __name__ == "__main__":

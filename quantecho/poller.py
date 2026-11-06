@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
+from .signals import SignalTracker
 from .telemetry import TelemetryStore
 
 
@@ -35,6 +36,7 @@ class Poller(threading.Thread):
         self._stop_evt = threading.Event()
         self._last_printed: Optional[float] = None
         self._next_bars = 0.0
+        self.signals = SignalTracker(self.focus)
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -61,6 +63,20 @@ class Poller(threading.Thread):
 
         if time.monotonic() >= self._next_bars:
             self._refresh_bars()
+        self._check_signals()
+
+    def _check_signals(self) -> None:
+        q = self.telemetry.quote(self.focus)
+        if not q or q.last is None:
+            return
+        hi, lo = self.telemetry.session_range(self.focus)
+        hi = max(hi, q.last) if hi is not None else None
+        lo = min(lo, q.last) if lo is not None else None
+        evs = self.signals.update(q.last, self.telemetry.ta(self.focus), hi, lo)
+        if evs:
+            self.telemetry.add_signals(self.focus, [e.line() for e in evs])
+            for e in evs:
+                self.events.put(("signal", e))
 
     def _refresh_bars(self) -> None:
         try:

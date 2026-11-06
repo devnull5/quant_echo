@@ -13,6 +13,8 @@ class TA:
     macd: Optional[float] = None
     macd_signal: Optional[float] = None
     macd_hist: Optional[float] = None
+    ema9: Optional[float] = None
+    ema20: Optional[float] = None
 
 
 def coerce_float(x: Any) -> Optional[float]:
@@ -82,7 +84,11 @@ def vwap_from_bars(bars: List[Dict[str, Any]]) -> Optional[float]:
     return pv / vv if vv > 0 else None
 
 
-def compute_ta(bars: List[Dict[str, Any]]) -> TA:
+def compute_ta(bars: List[Dict[str, Any]], vwap_bars: Optional[List[Dict[str, Any]]] = None) -> TA:
+    """Indicators on all bars; VWAP on `vwap_bars` (e.g. regular-session only) when given."""
     closes = [c for c in (coerce_float(b.get("close")) for b in bars) if c is not None]
     m, s, h = macd_12269(closes)
-    return TA(vwap=vwap_from_bars(bars), rsi14=rsi14(closes), macd=m, macd_signal=s, macd_hist=h)
+    e9, e20 = ema(closes, 9), ema(closes, 20)
+    return TA(vwap=vwap_from_bars(vwap_bars if vwap_bars else bars), rsi14=rsi14(closes), macd=m,
+              macd_signal=s, macd_hist=h, ema9=e9[-1] if len(closes) >= 9 else None,
+              ema20=e20[-1] if len(closes) >= 20 else None)

@@ -1,17 +1,19 @@
-"""Tk dashboard: watchlist, focus TA strip, event log, AI Q&A."""
+"""Tk dashboard: pick a data source, watchlist, focus TA strip, event log, local-AI (Ollama) Q&A."""
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox, ttk
-from typing import Optional
+from typing import Dict, Optional
 
-from . import ai
-from .config import Settings, load_settings, save_settings
+from . import journal, llm
+from .config import Settings, load_settings, normalize_host, save_settings
 from .poller import Poller
-from .schwab_provider import SchwabProvider
+from .providers import PROVIDERS, all_fields, create
 from .telemetry import TelemetryStore
 
 APP_NAME = "QuantEcho"
@@ -25,7 +27,10 @@ C = {
     "up": "#3fb950",
     "down": "#f85149",
     "accent": "#58a6ff",
+    "warn": "#d29922",
 }
+
+LABEL_TO_ID = {spec.label: pid for pid, spec in PROVIDERS.items()}
 
 
 def _f(x, nd=2, suffix=""):
@@ -36,8 +41,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1180x800")
-        self.minsize(900, 600)
+        self.geometry("1220x820")
+        self.minsize(960, 620)
         self.configure(bg=C["bg"])
         self._style()
 
@@ -47,29 +52,32 @@ class App(tk.Tk):
         self.poller: Optional[Poller] = None
 
         s = self.settings
-        self.v = {
-            "symbols": tk.StringVar(value=s.symbols),
-            "focus": tk.StringVar(value=s.focus),
-            "interval": tk.StringVar(value=str(s.interval)),
-            "model": tk.StringVar(value=s.model),
-            "schwab_app_key": tk.StringVar(value=s.schwab_app_key),
-            "schwab_app_secret": tk.StringVar(value=s.schwab_app_secret),
-            "schwab_callback": tk.StringVar(value=s.schwab_callback),
-            "schwab_token_path": tk.StringVar(value=s.schwab_token_path),
-            "openai_key": tk.StringVar(value=s.openai_key),
-        }
+        self.v_provider = tk.StringVar(value=PROVIDERS[s.provider].label)
+        self.v_symbols = tk.StringVar(value=s.symbols)
+        self.v_focus = tk.StringVar(value=s.focus)
+        self.v_interval = tk.StringVar(value=str(s.interval))
+        self.v_model = tk.StringVar(value=s.model)
+        self.v_host = tk.StringVar(value=s.ollama_host)
         self.v_remember = tk.BooleanVar(value=s.remember)
+        self.v_creds: Dict[str, tk.StringVar] = {f.key: tk.StringVar(value=s.creds.get(f.key, f.default))
+                                                 for f in all_fields()}
         self.v_question = tk.StringVar(value="What's the current bias for my focus symbol?")
         self.v_with_ctx = tk.BooleanVar(value=True)
+        self.v_think = tk.BooleanVar(value=False)
+        self.v_auto = tk.BooleanVar(value=False)
+        self.v_auto_min = tk.StringVar(value="15")
+        self._auto_job: Optional[str] = None
         self.v_status = tk.StringVar(value="Stopped")
+        self.v_ai_live = tk.StringVar(value="")
+        self.v_ai_status = tk.StringVar(value="")
 
         self._build()
+        self._render_provider_panel()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._pump)
-        if not (s.schwab_app_key and s.schwab_app_secret):
-            self.creds_frame.pack(side="top", fill="x", after=self.toolbar)
+        self.after(300, self.refresh_models)
 
-    # ---------- layout ----------
+    # ================================================================ layout
     def _style(self) -> None:
         st = ttk.Style(self)
         try:
@@ -80,43 +88,62 @@ class App(tk.Tk):
         st.configure("TFrame", background=C["panel"])
         st.configure("TLabel", background=C["panel"], foreground=C["text"])
         st.configure("Muted.TLabel", foreground=C["muted"])
+        st.configure("Warn.TLabel", foreground=C["warn"])
+        st.configure("Link.TLabel", foreground=C["accent"], font=("Segoe UI", 9, "underline"))
+        st.configure("H.TLabel", foreground=C["text"], font=("Segoe UI", 10, "bold"))
         st.configure("TA.TLabel", font=("Consolas", 11), foreground=C["accent"])
         st.configure("TButton", background="#1f2733", foreground=C["text"], padding=5)
         st.map("TButton", background=[("active", "#2a3443")])
         st.configure("TCheckbutton", background=C["panel"], foreground=C["text"])
         st.configure("TEntry", fieldbackground=C["sunken"], foreground=C["text"], insertcolor=C["text"])
+        st.configure("TCombobox", fieldbackground=C["sunken"], foreground=C["text"], background="#1f2733",
+                     arrowcolor=C["text"])
+        st.map("TCombobox", fieldbackground=[("readonly", C["sunken"])], foreground=[("readonly", C["text"])])
+        self.option_add("*TCombobox*Listbox.background", C["sunken"])
+        self.option_add("*TCombobox*Listbox.foreground", C["text"])
         st.configure("Treeview", background=C["sunken"], fieldbackground=C["sunken"], foreground=C["text"],
                      rowheight=24, font=("Consolas", 10))
         st.configure("Treeview.Heading", background="#1f2733", foreground=C["muted"])
 
-    def _entry(self, parent, label, key, width, secret=False):
+    def _entry(self, parent, label, var, width, secret=False):
         ttk.Label(parent, text=label, style="Muted.TLabel").pack(side="left", padx=(10, 4))
-        ttk.Entry(parent, textvariable=self.v[key], width=width, show="•" if secret else "").pack(side="left")
+        e = ttk.Entry(parent, textvariable=var, width=width, show="•" if secret else "")
+        e.pack(side="left")
+        return e
 
     def _build(self) -> None:
+        # --- toolbar
         self.toolbar = bar = ttk.Frame(self, padding=(0, 6))
         bar.pack(side="top", fill="x")
-        self._entry(bar, "Symbols", "symbols", 28)
-        self._entry(bar, "Focus", "focus", 7)
-        self._entry(bar, "Every (s)", "interval", 4)
-        self.btn_start = ttk.Button(bar, text="▶ Start", command=self.on_start)
-        self.btn_start.pack(side="left", padx=(12, 4))
+        ttk.Label(bar, text="Source", style="Muted.TLabel").pack(side="left", padx=(10, 4))
+        cb = ttk.Combobox(bar, textvariable=self.v_provider, values=list(LABEL_TO_ID), state="readonly", width=24)
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", self._on_provider_change)
+        self._entry(bar, "Symbols", self.v_symbols, 26)
+        self._entry(bar, "Focus", self.v_focus, 7)
+        self._entry(bar, "Every (s)", self.v_interval, 4)
+        ttk.Button(bar, text="▶ Start", command=self.on_start).pack(side="left", padx=(12, 4))
         ttk.Button(bar, text="■ Stop", command=self.on_stop).pack(side="left")
-        ttk.Button(bar, text="⚙ Keys", command=self._toggle_creds).pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="⚙ Settings", command=self._toggle_settings).pack(side="left", padx=(12, 0))
         ttk.Label(bar, textvariable=self.v_status, style="Muted.TLabel").pack(side="right", padx=10)
 
-        self.creds_frame = cf = ttk.Frame(self, padding=(0, 4))
-        r1 = ttk.Frame(cf); r1.pack(fill="x", pady=2)
-        self._entry(r1, "Schwab App Key", "schwab_app_key", 24, secret=True)
-        self._entry(r1, "App Secret", "schwab_app_secret", 24, secret=True)
-        self._entry(r1, "Callback", "schwab_callback", 26)
-        r2 = ttk.Frame(cf); r2.pack(fill="x", pady=2)
-        self._entry(r2, "Token file", "schwab_token_path", 24)
-        self._entry(r2, "OpenAI key", "openai_key", 24, secret=True)
-        self._entry(r2, "Model", "model", 12)
-        ttk.Checkbutton(r2, text="Remember keys", variable=self.v_remember).pack(side="left", padx=10)
-        ttk.Button(r2, text="Save", command=self.on_save).pack(side="left")
+        # --- settings panel (hidden by default)
+        self.settings_frame = sf = ttk.Frame(self, padding=(0, 4, 0, 8))
+        self.provider_frame = ttk.Frame(sf)
+        self.provider_frame.pack(fill="x")
+        ai_row = ttk.Frame(sf)
+        ai_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(ai_row, text="Local AI (Ollama)", style="H.TLabel").pack(side="left", padx=(10, 6))
+        self._entry(ai_row, "Host", self.v_host, 24)
+        ttk.Label(ai_row, text="Model", style="Muted.TLabel").pack(side="left", padx=(10, 4))
+        self.cb_model = ttk.Combobox(ai_row, textvariable=self.v_model, width=22)
+        self.cb_model.pack(side="left")
+        ttk.Button(ai_row, text="↻", width=3, command=self.refresh_models).pack(side="left", padx=4)
+        ttk.Label(ai_row, textvariable=self.v_ai_status, style="Muted.TLabel").pack(side="left", padx=6)
+        ttk.Button(ai_row, text="Save", command=self.on_save).pack(side="right", padx=10)
+        ttk.Checkbutton(ai_row, text="Remember keys", variable=self.v_remember).pack(side="right")
 
+        # --- body
         body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=10, pady=(4, 0))
 
@@ -143,53 +170,119 @@ class App(tk.Tk):
                             relief="flat", font=("Consolas", 10), padx=8, pady=6)
         self.text.tag_configure("q", foreground=C["accent"])
         self.text.tag_configure("a", foreground="#e3d7a3")
+        self.text.tag_configure("warn", foreground=C["warn"])
+        self.text.tag_configure("muted", foreground=C["muted"])
+        self.text.tag_configure("bull", foreground=C["up"])
+        self.text.tag_configure("bear", foreground=C["down"])
         self.text.pack(fill="both", expand=True)
         body.add(right, weight=3)
 
+        # --- Q&A
         qa = ttk.Frame(self, padding=(0, 8))
         qa.pack(side="bottom", fill="x")
+        auto = ttk.Frame(self)
+        auto.pack(side="bottom", fill="x")
+        ttk.Checkbutton(auto, text="Auto-analyze every", variable=self.v_auto,
+                        command=self._schedule_auto).pack(side="left", padx=(10, 4))
+        ttk.Entry(auto, textvariable=self.v_auto_min, width=4).pack(side="left")
+        ttk.Label(auto, text="min (while running)", style="Muted.TLabel").pack(side="left", padx=4)
+        ttk.Button(auto, text="📓 Journal", command=self.open_journal).pack(side="right", padx=10)
         q_entry = ttk.Entry(qa, textvariable=self.v_question)
         q_entry.pack(side="left", fill="x", expand=True, padx=(10, 6))
         q_entry.bind("<Return>", lambda _e: self.on_ask())
-        ttk.Checkbutton(qa, text="Include market context", variable=self.v_with_ctx).pack(side="left", padx=6)
-        ttk.Button(qa, text="Ask", command=self.on_ask).pack(side="left", padx=4)
-        ttk.Button(qa, text="Analyze focus", command=self.on_analyze).pack(side="left", padx=(4, 10))
+        ttk.Checkbutton(qa, text="Market context", variable=self.v_with_ctx).pack(side="left", padx=6)
+        ttk.Checkbutton(qa, text="Deep think (slower)", variable=self.v_think).pack(side="left", padx=6)
+        self.btn_ask = ttk.Button(qa, text="Ask", command=self.on_ask)
+        self.btn_ask.pack(side="left", padx=4)
+        self.btn_analyze = ttk.Button(qa, text="Analyze focus", command=self.on_analyze)
+        self.btn_analyze.pack(side="left", padx=(4, 10))
+        ttk.Label(qa, textvariable=self.v_ai_live, style="Muted.TLabel", width=22).pack(side="left")
 
-    def _toggle_creds(self) -> None:
-        if self.creds_frame.winfo_ismapped():
-            self.creds_frame.pack_forget()
-        else:
-            self.creds_frame.pack(side="top", fill="x", after=self.toolbar)
+    def _render_provider_panel(self) -> None:
+        for w in self.provider_frame.winfo_children():
+            w.destroy()
+        spec = PROVIDERS[self._provider_id()]
+        head = ttk.Frame(self.provider_frame)
+        head.pack(fill="x")
+        ttk.Label(head, text=spec.label, style="H.TLabel").pack(side="left", padx=(10, 8))
+        ttk.Label(head, text=spec.notes, style="Muted.TLabel", wraplength=820).pack(side="left")
+        if spec.signup_url:
+            link = ttk.Label(head, text="get a key ↗", style="Link.TLabel", cursor="hand2")
+            link.pack(side="left", padx=8)
+            link.bind("<Button-1>", lambda _e, u=spec.signup_url: webbrowser.open(u))
+        if spec.fields:
+            row = ttk.Frame(self.provider_frame)
+            row.pack(fill="x", pady=(4, 0))
+            for f in spec.fields:
+                self._entry(row, f.label, self.v_creds[f.key], 22 if f.secret else 26, secret=f.secret)
+        if spec.id == "schwab":
+            ttk.Label(self.provider_frame, text="First time / every 7 days: run  python -m quantecho.auth  "
+                      "in a terminal to log in.", style="Warn.TLabel").pack(anchor="w", padx=10, pady=(4, 0))
 
-    # ---------- helpers ----------
+    def _toggle_settings(self, show: Optional[bool] = None) -> None:
+        visible = self.settings_frame.winfo_ismapped()
+        if show is None:
+            show = not visible
+        if show and not visible:
+            self.settings_frame.pack(side="top", fill="x", after=self.toolbar)
+        elif not show and visible:
+            self.settings_frame.pack_forget()
+
+    # ================================================================ helpers
+    def _provider_id(self) -> str:
+        return LABEL_TO_ID.get(self.v_provider.get(), "yahoo")
+
     def log(self, s: str, tag: Optional[str] = None) -> None:
         self.text.insert("end", s.rstrip("\n") + "\n", tag or ())
         self.text.see("end")
 
+    def _ts(self) -> str:
+        return time.strftime("%H:%M:%S")
+
     def _collect(self) -> Settings:
-        s = Settings()
-        for k, var in self.v.items():
-            val = var.get().strip()
-            if k == "interval":
-                try:
-                    val = max(1, int(val))
-                except ValueError:
-                    val = 20
-            setattr(s, k, val)
-        s.focus = (s.focus or "SPY").upper()
-        s.remember = bool(self.v_remember.get())
-        return s
+        try:
+            interval = max(1, int(self.v_interval.get()))
+        except ValueError:
+            interval = 20
+        return Settings(
+            provider=self._provider_id(),
+            symbols=self.v_symbols.get().strip(),
+            focus=(self.v_focus.get().strip() or "SPY").upper(),
+            interval=interval,
+            model=self.v_model.get().strip() or llm.DEFAULT_MODEL,
+            ollama_host=normalize_host(self.v_host.get()),
+            remember=bool(self.v_remember.get()),
+            creds={k: v.get().strip() for k, v in self.v_creds.items()},
+        )
 
     def _pump(self) -> None:
         try:
             while True:
                 kind, payload = self.events.get_nowait()
                 if kind == "log":
-                    self.log(payload)
-                elif kind == "answer":
-                    self.log(payload, "a")
+                    self.log(payload, "warn" if "error" in payload.lower() else None)
+                elif kind == "ai_start":
+                    self.text.insert("end", payload, "q")
+                    self.text.insert("end", "\n")
+                    self.text.mark_set("ai", "end-2c")
+                    self.text.mark_gravity("ai", "right")
+                    self.text.see("end")
+                elif kind == "ai_tok":
+                    self.text.insert("ai", payload, "a")
+                    self.text.see("ai")
+                elif kind == "ai_think":
+                    self.v_ai_live.set(f"thinking… ~{payload // 4} tok")
+                elif kind == "ai_done":
+                    self.text.insert("ai", payload, "muted")
+                    self.text.see("end")
+                    self.v_ai_live.set("")
+                    self._ai_busy(False)
+                elif kind == "signal":
+                    self.log(f"[{self._ts()}] ⚡ {payload.text}", payload.kind if payload.kind != "info" else "muted")
                 elif kind == "quotes":
                     self._refresh_table()
+                elif kind == "models":
+                    self._apply_models(payload)
         except queue.Empty:
             pass
         self.after(100, self._pump)
@@ -214,20 +307,27 @@ class App(tk.Tk):
                 self.tree.insert("", "end", iid=sym, text=sym, values=vals, tags=tags)
         ta = self.telemetry.ta(focus)
         q = self.telemetry.quote(focus)
-        vs = ""
-        if q and q.last and ta.vwap:
-            vs = f" ({(q.last - ta.vwap) / ta.vwap:+.2%})"
+        vs = f" ({(q.last - ta.vwap) / ta.vwap:+.2%})" if q and q.last and ta.vwap else ""
         self.ta_label.configure(
-            text=f"{focus}  VWAP {_f(ta.vwap)}{vs}   RSI {_f(ta.rsi14, 1)}   "
-                 f"MACD {_f(ta.macd, 3)} / {_f(ta.macd_signal, 3)}  hist {_f(ta.macd_hist, 3)}"
+            text=f"{focus}  VWAP {_f(ta.vwap)}{vs}   EMA9 {_f(ta.ema9)}  EMA20 {_f(ta.ema20)}   "
+                 f"RSI {_f(ta.rsi14, 1)}   MACD {_f(ta.macd, 3)} / {_f(ta.macd_signal, 3)}  hist {_f(ta.macd_hist, 3)}"
         )
 
-    # ---------- actions ----------
+    # ================================================================ data actions
+    def _on_provider_change(self, _evt=None) -> None:
+        self._render_provider_panel()
+        spec = PROVIDERS[self._provider_id()]
+        if spec.fields and not all(self.v_creds[f.key].get().strip() for f in spec.fields if f.secret):
+            self._toggle_settings(True)
+        if self.poller:
+            self.on_stop()
+            self.after(200, self.on_start)
+
     def on_save(self) -> None:
         self.settings = self._collect()
         try:
             save_settings(self.settings)
-            self.log(f"[{time.strftime('%H:%M:%S')}] Settings saved.")
+            self.log(f"[{self._ts()}] Settings saved.")
         except OSError as e:
             messagebox.showerror("Save failed", str(e))
 
@@ -235,22 +335,24 @@ class App(tk.Tk):
         if self.poller and self.poller.is_alive():
             return
         s = self.settings = self._collect()
-        if not s.schwab_app_key or not s.schwab_app_secret:
-            messagebox.showwarning("Schwab", "Enter your Schwab App Key and App Secret (⚙ Keys).")
-            if not self.creds_frame.winfo_ismapped():
-                self._toggle_creds()
-            return
+        spec = PROVIDERS[s.provider]
         try:
-            provider = SchwabProvider(s.schwab_app_key, s.schwab_app_secret, s.schwab_token_path)
+            provider = create(s.provider, s.creds)
         except Exception as e:
-            messagebox.showerror("Schwab auth", str(e))
+            self._toggle_settings(True)
+            messagebox.showerror(spec.label, str(e))
             return
+        interval = max(s.interval, spec.min_interval)
+        if interval != s.interval:
+            self.log(f"[{self._ts()}] {spec.label}: free-tier limits → polling every {interval}s "
+                     f"instead of {s.interval}s.", "warn")
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-        self.poller = Poller(provider, s.symbols.replace(",", " ").split(), s.focus, s.interval,
-                             self.events, self.telemetry, bars_every=max(60, s.interval))
+        self.telemetry = TelemetryStore()
+        self.poller = Poller(provider, s.symbols.replace(",", " ").split(), s.focus, interval,
+                             self.events, self.telemetry, bars_every=max(spec.min_bars_every, interval))
         self.poller.start()
-        self.v_status.set(f"Live · {s.focus}")
+        self.v_status.set(f"Live · {spec.label} · {s.focus}")
 
     def on_stop(self) -> None:
         if self.poller:
@@ -261,45 +363,125 @@ class App(tk.Tk):
     def _on_tree_dbl(self, _evt=None) -> None:
         sel = self.tree.focus()
         if sel and (not self.poller or sel != self.poller.focus):
-            self.v["focus"].set(sel)
+            self.v_focus.set(sel)
             if self.poller:
                 self.on_stop()
                 self.after(200, self.on_start)
 
-    def _run_ai(self, prompt: str) -> None:
-        s = self._collect()
-        if not s.openai_key:
-            self.log("[AI] OpenAI key missing (⚙ Keys).")
+    # ================================================================ AI actions
+    def refresh_models(self) -> None:
+        host = normalize_host(self.v_host.get())
+        self.v_ai_status.set("checking…")
+        threading.Thread(target=lambda: self.events.put(("models", llm.list_models(host))), daemon=True).start()
+
+    def _apply_models(self, models) -> None:
+        # recommended (commercially licensed) models first
+        models = sorted(models, key=lambda m: (m not in llm.RECOMMENDED, m))
+        self.cb_model.configure(values=models)
+        if not models:
+            self.v_ai_status.set(f"⚠ No models / Ollama not reachable — run: ollama pull {llm.DEFAULT_MODEL}")
             return
+        cur = self.v_model.get().strip()
+        if cur not in models and f"{cur}:latest" not in models:
+            self.v_model.set(llm.DEFAULT_MODEL if llm.DEFAULT_MODEL in models else models[0])
+        lic = llm.RECOMMENDED.get(self.v_model.get(), "check the model's license")
+        self.v_ai_status.set(f"● {len(models)} installed · {self.v_model.get()}: {lic}")
+        model, host = self.v_model.get(), normalize_host(self.v_host.get())
+        threading.Thread(target=llm.preload, args=(model, host), daemon=True).start()  # warm the GPU
+
+    def _ai_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        self.btn_ask.configure(state=state)
+        self.btn_analyze.configure(state=state)
+
+    def _run_ai(self, prompt: str, think: Optional[bool] = None, title: str = "Ask", ctx: str = "") -> None:
+        s = self._collect()
+        think = bool(self.v_think.get()) if think is None else think
+        self._ai_busy(True)
+        self.v_ai_live.set("loading model…")
+        self.events.put(("ai_start", f"[{self._ts()}] A ({s.model}{', deep think' if think else ''})>"))
 
         def worker():
-            ans = ai.ask(prompt, model=s.model or "gpt-5", api_key=s.openai_key)
-            self.events.put(("answer", f"[{time.strftime('%H:%M:%S')}] A> {ans}\n"))
+            t0 = time.monotonic()
+            first = [True]
+
+            def tok(t: str) -> None:
+                if first[0]:
+                    first[0] = False
+                    self.events.put(("ai_tok", "\n"))
+                self.events.put(("ai_tok", t))
+
+            text, st = llm.ask_stream(prompt, tok, model=s.model, host=s.ollama_host, think=think,
+                                      on_thinking=lambda n: self.events.put(("ai_think", n)))
+            if first[0]:  # nothing streamed -> error/empty message
+                self.events.put(("ai_tok", " " + text))
+            speed = f", {st.tok_per_s:.0f} tok/s" if st.tok_per_s else ""
+            note = ""
+            if not text.startswith("[Ollama"):
+                try:
+                    journal.append(f"{title} · {s.model}", text, context=ctx)
+                    note = " · journaled"
+                except OSError:
+                    pass
+            self.events.put(("ai_done", f"\n  ({time.monotonic() - t0:.0f}s{speed}{note})"))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def on_ask(self) -> None:
         q = self.v_question.get().strip()
-        if not q:
+        if not q or str(self.btn_ask.cget("state")) == "disabled":
             return
-        self.log(f"[{time.strftime('%H:%M:%S')}] Q> {q}", "q")
-        prompt = q
+        self.log(f"[{self._ts()}] Q> {q}", "q")
+        prompt, ctx = q, ""
         if self.v_with_ctx.get():
-            ctx = self.telemetry.context(self._collect().focus)
+            ctx = self.telemetry.context(self._collect().focus) or ""
             if ctx:
                 prompt = f"{q}\n\nTelemetry:\n{ctx}"
             else:
                 self.log("[AI] No telemetry yet; asking without market context.")
-        self._run_ai(prompt)
+        self._run_ai(prompt, title=f"Q: {q[:80]}", ctx=ctx)
 
-    def on_analyze(self) -> None:
-        focus = self._collect().focus
+    def on_analyze(self, auto: bool = False) -> None:
+        if str(self.btn_analyze.cget("state")) == "disabled":
+            return
+        focus = self.poller.focus if self.poller else self._collect().focus
         ctx = self.telemetry.context(focus)
         if not ctx:
-            self.log("[AI] No telemetry yet — press Start first.")
+            if not auto:
+                self.log("[AI] No telemetry yet — press Start first.")
             return
-        self.log(f"[{time.strftime('%H:%M:%S')}] Analyzing {focus}…", "q")
-        self._run_ai(ai.ANALYZE_TEMPLATE.format(ctx=ctx))
+        self.log(f"[{self._ts()}] {'Auto-a' if auto else 'A'}nalyzing {focus} with {self.v_model.get()}…", "q")
+        self._run_ai(llm.ANALYZE_TEMPLATE.format(ctx=ctx), think=True,
+                     title=f"{'Auto ' if auto else ''}Analysis {focus}", ctx=ctx)
+
+    # ---------- auto-analyze / journal
+    def _schedule_auto(self) -> None:
+        if self._auto_job:
+            self.after_cancel(self._auto_job)
+            self._auto_job = None
+        if not self.v_auto.get():
+            return
+        try:
+            minutes = max(1.0, float(self.v_auto_min.get()))
+        except ValueError:
+            minutes = 15.0
+        self._auto_job = self.after(int(minutes * 60_000), self._auto_tick)
+
+    def _auto_tick(self) -> None:
+        self._auto_job = None
+        if self.poller and self.poller.is_alive():
+            self.on_analyze(auto=True)
+        self._schedule_auto()
+
+    def open_journal(self) -> None:
+        path = journal.journal_path()
+        if not path.exists():
+            self.log(f"[Journal] Nothing yet today — analyses are saved to {path}")
+            return
+        try:
+            os.startfile(str(path))  # type: ignore[attr-defined]  # Windows
+        except (AttributeError, OSError):
+            webbrowser.open(path.as_uri())
 
     def _on_close(self) -> None:
         self.on_stop()
