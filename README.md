@@ -16,11 +16,12 @@ leaves your machine except market-data requests. **Read-only:** it never places 
 
 ## Data sources
 
-Pick one from the **Source** dropdown. Keys go in **⚙ Settings** or `.env`.
+On first launch a picker offers three zero-hassle starts: **Crypto** (Coinbase, live, no signup),
+**US stocks** (free Alpaca key, ~2 min) or **Demo**. Change source any time from the **Source**
+dropdown; keys go in **⚙ Settings** (saved to your OS keychain) or `.env`.
 
 | Source | Key? | Quotes | 1-min bars / TA | Free-tier notes | Verified live |
 |---|---|---|---|---|---|
-| Yahoo Finance | none | ✓ | ✓ | Unofficial endpoint; default | ✓ quotes + bars |
 | Charles Schwab | app key + secret | ✓ real-time, bid/ask | ✓ | Run `python -m quantecho.auth`; token lasts 7 days | parser vs. API docs |
 | Alpaca | key id + secret | ✓ bid/ask | ✓ | Free = IEX feed; `sip` needs paid plan | endpoint + auth errors |
 | Tiingo (IEX) | token | ✓ bid/ask | ✓ | ~50 req/hr free → polls every 60s | endpoint + auth errors |
@@ -28,7 +29,14 @@ Pick one from the **Source** dropdown. Keys go in **⚙ Settings** or `.env`.
 | Polygon.io / Massive | key | paid (free = prev close) | ✓ (delayed on free) | 5 req/min free | endpoint + auth errors |
 | Twelve Data | key | ✓ | ✓ | 8 credits/min (1 per symbol) | ✓ quotes + bars (demo key) |
 | Alpha Vantage | key | ✓ | ✓ | 25 requests/**day** free | ✓ quote + bar format (demo key) |
-| Simulated | none | fake | fake | Offline demo / UI testing | n/a |
+| **Coinbase** (crypto) | none | ✓ real-time, bid/ask, 24h % | ✓ (UTC day) | Official public API, ~10 req/s | ✓ quotes + bars |
+| Simulated | none | fake | fake | Offline demo / UI testing (default) | n/a |
+| Yahoo Finance ⚠️ | none | ✓ | ✓ | **Personal use only**: unofficial endpoint; hidden unless you tick *Show personal-use-only sources* | ✓ quotes + bars |
+
+**Why is Yahoo hidden?** It has no official API and its terms don't allow redistributing its data, so
+QuantEcho doesn't offer it by default. You can still enable it for yourself in ⚙ Settings. For stocks,
+use a free key from Alpaca, Twelve Data, Tiingo or Finnhub: you sign up, you agree to their terms,
+and the data flows straight to you.
 
 "Endpoint + auth errors" means the real API was hit and its error responses are handled, but no
 real data has been parsed yet. If you use one of those, please open an issue with what you see.

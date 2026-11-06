@@ -101,7 +101,8 @@ SPEC = ProviderSpec(
               default="https://127.0.0.1:8182"),
         Field("schwab_token_path", "Token file", "SCHWAB_TOKEN_PATH", secret=False, default="tokens.json"),
     ),
-    notes="Real-time with a Schwab account. Run `python -m quantecho.auth` first; token lasts 7 days.",
+    notes="Bring your own Schwab developer app (personal use). Real-time with a Schwab account. "
+          "Run `python -m quantecho.auth` first; token lasts 7 days.",
     min_interval=2,
     signup_url="https://developer.schwab.com",
 )

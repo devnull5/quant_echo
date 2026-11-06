@@ -34,6 +34,8 @@ class Settings:
     model: str = DEFAULT_MODEL
     ollama_host: str = DEFAULT_HOST
     remember: bool = True
+    show_personal_sources: bool = False  # list Yahoo etc. (unofficial / personal-use-only terms)
+    first_run_done: bool = False
     creds: Dict[str, str] = field(default_factory=dict)
 
 
@@ -85,10 +87,15 @@ def load_settings(path: Path = SETTINGS_PATH) -> Settings:
             except (TypeError, ValueError):
                 continue
         setattr(s, name, str(val) if name != "interval" else val)
-    if "remember" in saved:
-        s.remember = bool(saved["remember"])
+    for flag in ("remember", "show_personal_sources", "first_run_done"):
+        if flag in saved:
+            setattr(s, flag, bool(saved[flag]))
     if s.provider not in PROVIDERS:
         s.provider = DEFAULT_PROVIDER
+    if PROVIDERS[s.provider].personal_use_only:
+        s.show_personal_sources = True  # user already chose it (e.g. older versions defaulted to Yahoo)
+    if (saved and "first_run_done" not in saved) or (not saved and os.getenv("DATA_PROVIDER")):
+        s.first_run_done = True  # existing user (older settings file) or configured via .env: no picker
     s.ollama_host = normalize_host(s.ollama_host)
 
     saved_creds = saved.get("creds") if isinstance(saved.get("creds"), dict) else {}

@@ -467,7 +467,7 @@ class TestConfig(unittest.TestCase):
             path.write_text(json.dumps({"schwab_app_key": "OLD", "provider": "nope"}))
             s = load_settings(path)
             self.assertEqual(s.creds["schwab_app_key"], "OLD")
-            self.assertEqual(s.provider, "yahoo")
+            self.assertEqual(s.provider, "simulated")  # unknown provider -> safe demo default
 
     def test_normalize_host(self):
         self.assertEqual(normalize_host("0.0.0.0"), "http://127.0.0.1:11434")
@@ -568,6 +568,84 @@ class TestSignalsAndHygiene(unittest.TestCase):
             txt = p.read_text(encoding="utf-8")
             self.assertEqual(txt.count("# QuantEcho journal"), 1)
             self.assertIn("**Bias:** neutral", txt)
+
+
+class TestCryptoAndStoreSafety(unittest.TestCase):
+    def test_coinbase_symbols(self):
+        from quantecho.providers.coinbase import normalize_symbol
+        self.assertEqual(normalize_symbol("btc"), "BTC-USD")
+        self.assertEqual(normalize_symbol("eth/eur"), "ETH-EUR")
+        self.assertEqual(normalize_symbol("SOLUSDT"), "SOL-USDT")
+        self.assertEqual(normalize_symbol("BTC-USD"), "BTC-USD")
+
+    def test_coinbase_provider(self):
+        from quantecho.providers.coinbase import CoinbaseProvider
+        t0 = 1793982960
+        ticker = {"ask": "75599.66", "bid": "75599.65", "price": "75599.65", "volume": "11790.4",
+                  "time": "2026-11-06T16:40:15.377583815Z"}
+        stats = {"open": "76270.12", "high": "76437.85", "low": "74722", "last": "75627.43", "volume": "11793.8"}
+        candles = [[t0, 75700.01, 75781.5, 75760.16, 75720.99, 11.08], [t0 - 60, 75761.31, 75850, 75801.98, 75761.36, 12.4]]
+        http = FakeHttp({"BTC-USD/ticker": ticker, "BTC-USD/stats": stats, "BTC-USD/candles": candles,
+                         "NOPE-USD": ProviderError('HTTP 404: {"message":"NotFound"}')})
+        p = CoinbaseProvider(http=http)
+        q = p.get_quotes(["BTC-USD", "NOPE"])
+        self.assertEqual(list(q), ["BTC-USD"])                      # bad product skipped, good one kept
+        b = q["BTC-USD"]
+        self.assertEqual((b.last, b.bid, b.ask), (75599.65, 75599.65, 75599.66))
+        self.assertAlmostEqual(b.net_pct, (75599.65 - 76270.12) / 76270.12 * 100)
+        bars = p.get_session_minute_bars("btc")
+        self.assertEqual([x["t"] for x in bars], [(t0 - 60) * 1000, t0 * 1000])   # oldest first, deduped
+        self.assertEqual((bars[-1]["open"], bars[-1]["high"], bars[-1]["low"]), (75760.16, 75781.5, 75700.01))
+        with self.assertRaises(ProviderError):
+            CoinbaseProvider(http=FakeHttp({"NOPE-USD": ProviderError("HTTP 404: NotFound")})).get_quotes(["NOPE"])
+
+    def test_crypto_session_is_utc_day(self):
+        from quantecho.telemetry import session_bars
+        late = int(datetime(2026, 11, 5, 23, 59, tzinfo=NY).timestamp() * 1000)   # = 04:59 UTC on 11-06
+        bars = [{"t": late - 3600_000 * 6, "close": 1}, {"t": late, "close": 2}]
+        self.assertEqual(len(session_bars(bars, "crypto")), 1)       # 6h earlier is the previous UTC day
+        self.assertEqual(session_bars(bars, "equity"), [])           # both outside US regular hours
+
+    def test_crypto_context_and_vwap(self):
+        tel = TelemetryStore(market="crypto")
+        tel.update_quotes(SimulatedProvider(seed=3).get_quotes(["BTC-USD"]))
+        now = int(time_now_ms() // 60_000 * 60_000)
+        tel.update_bars("BTC-USD", [{"t": now - i * 60_000, "open": 100, "high": 101, "low": 99, "close": 100 + i % 3,
+                                     "volume": 10} for i in range(120, 0, -1)])
+        ctx = tel.context("BTC-USD")
+        self.assertIn("trades 24/7", ctx)
+        self.assertIn("VWAP(UTC day)", ctx)
+        self.assertNotIn("pre-market", ctx)
+        self.assertIsNotNone(tel.ta("BTC-USD").vwap)
+
+    def test_personal_sources_hidden_by_default(self):
+        from quantecho.providers import DEFAULT_PROVIDER, PROVIDERS, visible_providers
+        ids = [s.id for s in visible_providers(False)]
+        self.assertNotIn("yahoo", ids)
+        self.assertIn("coinbase", ids)
+        self.assertIn("yahoo", [s.id for s in visible_providers(False, current="yahoo")])
+        self.assertFalse(PROVIDERS[DEFAULT_PROVIDER].personal_use_only)
+        self.assertFalse(PROVIDERS[DEFAULT_PROVIDER].fields)       # default works with zero setup
+
+    def test_existing_yahoo_user_keeps_yahoo(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.json"
+            path.write_text(json.dumps({"provider": "yahoo"}))
+            s = load_settings(path)
+            self.assertEqual(s.provider, "yahoo")
+            self.assertTrue(s.show_personal_sources)
+            self.assertTrue(s.first_run_done)            # existing user: no welcome picker
+
+    def test_new_user_sees_picker(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict("os.environ", {"DATA_PROVIDER": ""}):
+            s = load_settings(Path(d) / "missing.json")
+            self.assertFalse(s.first_run_done)
+            self.assertEqual(s.provider, "simulated")
+
+
+def time_now_ms():
+    import time as _t
+    return _t.time() * 1000
 
 
 if __name__ == "__main__":

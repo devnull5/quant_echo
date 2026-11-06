@@ -43,6 +43,10 @@ class ProviderSpec:
     min_interval: int = 1      # seconds between quote polls the free tier tolerates
     min_bars_every: int = 60   # seconds between bar refreshes
     signup_url: str = ""
+    market: str = "equity"        # "equity" (US session hours) or "crypto" (24/7, UTC day)
+    personal_use_only: bool = False  # unofficial / terms forbid redistribution -> hidden unless opted in
+    default_symbols: str = "SPY QQQ NVDA"
+    clip_volume_spikes: bool = False  # cap absurd single-bar volume (for feeds known to glitch)
 
 
 class ProviderError(RuntimeError):

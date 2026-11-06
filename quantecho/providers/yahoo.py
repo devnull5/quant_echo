@@ -76,6 +76,9 @@ SPEC = ProviderSpec(
     id="yahoo",
     label="Yahoo Finance (no key)",
     factory=lambda c: YahooProvider(),
-    notes="Free, no signup. Unofficial endpoint — fine for personal use, may rate-limit or change.",
+    notes="PERSONAL USE ONLY: unofficial endpoint whose terms don't allow redistribution. No signup; may "
+          "rate-limit or change without notice.",
     min_interval=10,
+    personal_use_only=True,
+    clip_volume_spikes=True,  # Yahoo 1-min data has occasional 50-100x phantom volume bars
 )

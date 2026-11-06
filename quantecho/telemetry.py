@@ -23,6 +23,7 @@ class Snapshot:
     ta: TA = field(default_factory=TA)
     signals: List[str] = field(default_factory=list)  # recent signal lines, oldest first
     clipped: int = 0  # bars whose volume was capped as a feed glitch
+    market: str = "equity"  # "equity" | "crypto"
 
 
 def _fmt(x: Optional[float], nd: int = 2) -> str:
@@ -47,7 +48,18 @@ def session_phase(ms: int) -> str:
     return "after-hours"
 
 
-def clip_volume_outliers(bars: List[Dict[str, Any]], factor: float = 15.0) -> tuple:
+def session_bars(bars: List[Dict[str, Any]], market: str = "equity") -> List[Dict[str, Any]]:
+    """Bars of the current 'session': US regular hours for equities, the UTC day of the latest bar for
+    24/7 crypto markets."""
+    if market == "crypto":
+        if not bars:
+            return []
+        day = datetime.fromtimestamp(bars[-1]["t"] / 1000, tz=timezone.utc).date()
+        return [b for b in bars if datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).date() == day]
+    return [b for b in bars if is_rth(b["t"])]
+
+
+def clip_volume_outliers(bars: List[Dict[str, Any]], factor: float = 15.0, market: str = "equity") -> tuple:
     """Cap any single bar's volume at `factor` x the median non-zero regular-session volume
     (pre-market volume is tiny and would make the normal opening surge look like an outlier).
 
@@ -58,7 +70,7 @@ def clip_volume_outliers(bars: List[Dict[str, Any]], factor: float = 15.0) -> tu
     def positive(rows):
         return sorted(v for v in (b.get("volume") for b in rows) if isinstance(v, (int, float)) and v > 0)
 
-    vols = positive([b for b in bars if is_rth(b["t"])])
+    vols = positive(session_bars(bars, market))
     if len(vols) < 20:
         vols = positive(bars)
     if len(vols) < 20:
@@ -121,7 +133,8 @@ def structure_5m(b5: List[Dict[str, Any]]) -> Optional[str]:
     return "last three 5-min bars: mixed / overlapping (no clear structure)"
 
 
-def compute_facts(last: Optional[float], ta: TA, bars: List[Dict[str, Any]], rel_vol: Optional[float]) -> List[str]:
+def compute_facts(last: Optional[float], ta: TA, bars: List[Dict[str, Any]], rel_vol: Optional[float],
+                  market: str = "equity") -> List[str]:
     """Deterministic, plain-English readings so the LLM interprets rather than computes."""
     if last is None:
         return []
@@ -143,12 +156,41 @@ def compute_facts(last: Optional[float], ta: TA, bars: List[Dict[str, Any]], rel
     if ta.macd is not None and ta.macd_signal is not None:
         out.append(f"MACD is {'above' if ta.macd >= ta.macd_signal else 'below'} its signal line; histogram "
                    f"{'positive' if (ta.macd_hist or 0) >= 0 else 'negative'}")
-    rth = [b for b in bars if is_rth(b["t"])]
+    rth = session_bars(bars, market)
     if rth:
         hi = max(b.get("high") or b["close"] for b in rth)
         lo = min(b.get("low") or b["close"] for b in rth)
-        out.append(f"Distance to session high {hi:.2f}: {hi - last:+.2f} ({(hi - last) / last:+.2%}); "
+        out.append(f"Distance to {'UTC-day' if market == 'crypto' else 'session'} high {hi:.2f}: {hi - last:+.2f} ({(hi - last) / last:+.2%}); "
                    f"to session low {lo:.2f}: {lo - last:+.2f} ({(lo - last) / last:+.2%})")
+    major = {"VWAP": ta.vwap, "EMA9": ta.ema9, "EMA20": ta.ema20}
+    if rth:
+        major["day high"], major["day low"] = hi, lo
+    b5 = resample(bars, 5)[-13:-1]  # last hour of completed 5-min bars
+    swing = {}
+    if b5:
+        h = max(b5, key=lambda b: b["high"])
+        lo5 = min(b5, key=lambda b: b["low"])
+        swing[f"1h swing high ({_ny(h['t']):%H:%M})"] = h["high"]
+        swing[f"1h swing low ({_ny(lo5['t']):%H:%M})"] = lo5["low"]
+
+    def side(pred, reverse):
+        cands = sorted(((v, k) for k, v in {**major, **swing}.items() if v and pred(v)), reverse=reverse)
+        picked: List[tuple] = []
+        for v, k in cands:  # merge levels within 0.05% of each other
+            if picked and abs(v - picked[-1][0]) / last < 0.0005:
+                picked[-1] = (picked[-1][0], picked[-1][1] + " / " + k)
+            else:
+                picked.append((v, k))
+        return picked[:4]
+
+    below = side(lambda v: v < last, True)
+    above = side(lambda v: v > last, False)
+    if below:
+        out.append("Support candidates (BELOW price, nearest first): "
+                   + ", ".join(f"{v:.2f} {k}" for v, k in below))
+    if above:
+        out.append("Resistance candidates (ABOVE price, nearest first): "
+                   + ", ".join(f"{v:.2f} {k}" for v, k in above))
     if rel_vol is not None:
         label = "light" if rel_vol < 0.7 else "heavy" if rel_vol > 1.3 else "normal"
         out.append(f"Recent volume is {label} ({rel_vol:.2f}x)")
@@ -162,28 +204,33 @@ def render_context(snap: Snapshot, n5: int = 12) -> str:
     q, ta, bars = snap.quote, snap.ta, snap.bars
     last = q.last if q and q.last is not None else (bars[-1]["close"] if bars else None)
     now_ms = int(time.time() * 1000)
+    crypto = snap.market == "crypto"
     lines = [f"SYMBOL: {snap.symbol}   (times US/Eastern, now {_ny(now_ms):%Y-%m-%d %H:%M})"]
+    if crypto:
+        lines.append("Market: crypto, trades 24/7. 'Day' = current UTC day; % change is vs 24 hours ago.")
 
     if q:
         prev = (q.last - q.net_change) if q.last is not None and q.net_change is not None else None
         age = f"{(now_ms - q.timestamp_ms) / 1000:.0f}s old" if q.timestamp_ms else "age n/a"
         ba = f"  Bid {_fmt(q.bid)} / Ask {_fmt(q.ask)}" if q.bid or q.ask else ""
-        lines.append(f"Last {_fmt(last)}  ({_fmt(q.net_pct)}% vs prev close {_fmt(prev)}){ba}  [{age}]")
+        ref = "price 24h ago" if crypto else "prev close"
+        lines.append(f"Last {_fmt(last)}  ({_fmt(q.net_pct)}% vs {ref} {_fmt(prev)}){ba}  [{age}]")
     if bars:
-        lines.append(f"Phase of latest bar: {session_phase(bars[-1]['t'])} ({_ny(bars[-1]['t']):%Y-%m-%d %H:%M})")
-        rth = [b for b in bars if is_rth(b["t"])]
+        if not crypto:
+            lines.append(f"Phase of latest bar: {session_phase(bars[-1]['t'])} ({_ny(bars[-1]['t']):%Y-%m-%d %H:%M})")
+        rth = session_bars(bars, snap.market)
         if rth:
             hi = max(b.get("high") or b["close"] for b in rth)
             lo = min(b.get("low") or b["close"] for b in rth)
-            lines.append(f"Regular session: open {_fmt(rth[0].get('open'))}  high {_fmt(hi)}  low {_fmt(lo)}"
-                         f"  ({len(rth)} min)")
+            lines.append(f"{'UTC day' if crypto else 'Regular session'}: open {_fmt(rth[0].get('open'))}  "
+                         f"high {_fmt(hi)}  low {_fmt(lo)}  ({len(rth)} min)")
             if last is not None and hi > lo:
                 lines.append(f"Position in day range: {(last - lo) / (hi - lo):.0%} (0%=low, 100%=high)")
 
     def rel(level: Optional[float]) -> str:
         return f" ({(last - level) / level:+.2%})" if last is not None and level else ""
 
-    lines.append(f"VWAP(RTH) {_fmt(ta.vwap)}{rel(ta.vwap)}   EMA9 {_fmt(ta.ema9)}{rel(ta.ema9)}"
+    lines.append(f"VWAP({'UTC day' if crypto else 'RTH'}) {_fmt(ta.vwap)}{rel(ta.vwap)}   EMA9 {_fmt(ta.ema9)}{rel(ta.ema9)}"
                  f"   EMA20 {_fmt(ta.ema20)}{rel(ta.ema20)}")
     lines.append(f"RSI14(1m) {_fmt(ta.rsi14, 1)}   MACD(1m) {_fmt(ta.macd, 3)} / signal {_fmt(ta.macd_signal, 3)}"
                  f" / hist {_fmt(ta.macd_hist, 3)}")
@@ -197,7 +244,7 @@ def render_context(snap: Snapshot, n5: int = 12) -> str:
             rel_vol = sum(recent) / 5 / avg_base
             lines.append(f"Relative volume (last 5 min vs prior hour avg): {rel_vol:.2f}x")
 
-    facts = compute_facts(last, ta, bars, rel_vol)
+    facts = compute_facts(last, ta, bars, rel_vol, snap.market)
     if facts:
         lines.append("FACTS (computed by code — treat as correct, do not contradict):")
         lines += [f"  - {f}" for f in facts]
@@ -218,12 +265,14 @@ def render_context(snap: Snapshot, n5: int = 12) -> str:
 
 
 class TelemetryStore:
-    def __init__(self) -> None:
+    def __init__(self, market: str = "equity", clip_volume: bool = False) -> None:
         self._lock = threading.RLock()
         self._snaps: Dict[str, Snapshot] = {}
+        self.market = market
+        self.clip_volume = clip_volume
 
     def _get(self, sym: str) -> Snapshot:
-        return self._snaps.setdefault(sym, Snapshot(sym))
+        return self._snaps.setdefault(sym, Snapshot(sym, market=self.market))
 
     def update_quotes(self, quotes: Dict[str, Quote]) -> None:
         with self._lock:
@@ -231,8 +280,8 @@ class TelemetryStore:
                 self._get(sym.upper()).quote = q
 
     def update_bars(self, symbol: str, bars: List[Dict[str, Any]]) -> None:
-        bars, clipped = clip_volume_outliers(bars)
-        rth = [b for b in bars if is_rth(b["t"])]
+        bars, clipped = clip_volume_outliers(bars, market=self.market) if self.clip_volume else (list(bars), 0)
+        rth = session_bars(bars, self.market)
         ta = compute_ta(bars, vwap_bars=rth or None)
         with self._lock:
             s = self._get(symbol.upper())
@@ -247,7 +296,7 @@ class TelemetryStore:
         """(high, low) of the regular session so far, or (None, None)."""
         with self._lock:
             s = self._snaps.get(symbol.upper())
-            rth = [b for b in (s.bars if s else []) if is_rth(b["t"])]
+            rth = session_bars(s.bars if s else [], self.market)
         if not rth:
             return None, None
         return (max(b.get("high") or b["close"] for b in rth), min(b.get("low") or b["close"] for b in rth))

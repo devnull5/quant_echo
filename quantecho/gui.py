@@ -15,7 +15,7 @@ from . import journal, llm, logsetup
 from .logsetup import log as filelog
 from .config import Settings, keyring_available, load_settings, normalize_host, save_settings
 from .poller import Poller
-from .providers import PROVIDERS, all_fields, create
+from .providers import PROVIDERS, all_fields, create, visible_providers
 from .telemetry import TelemetryStore
 
 APP_NAME = "QuantEcho"
@@ -63,6 +63,8 @@ class App(tk.Tk):
         self.v_model = tk.StringVar(value=s.model)
         self.v_host = tk.StringVar(value=s.ollama_host)
         self.v_remember = tk.BooleanVar(value=s.remember)
+        self.v_show_personal = tk.BooleanVar(value=s.show_personal_sources)
+        self._market = PROVIDERS[s.provider].market
         self.v_creds: Dict[str, tk.StringVar] = {f.key: tk.StringVar(value=s.creds.get(f.key, f.default))
                                                  for f in all_fields()}
         self.v_question = tk.StringVar(value="What's the current bias for my focus symbol?")
@@ -80,6 +82,8 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._pump)
         self.after(300, self.refresh_models)
+        if not s.first_run_done:
+            self.after(400, self.first_run_picker)
 
     # ================================================================ layout
     def _style(self) -> None:
@@ -120,9 +124,10 @@ class App(tk.Tk):
         self.toolbar = bar = ttk.Frame(self, padding=(0, 6))
         bar.pack(side="top", fill="x")
         ttk.Label(bar, text="Source", style="Muted.TLabel").pack(side="left", padx=(10, 4))
-        cb = ttk.Combobox(bar, textvariable=self.v_provider, values=list(LABEL_TO_ID), state="readonly", width=24)
+        self.cb_provider = cb = ttk.Combobox(bar, textvariable=self.v_provider, state="readonly", width=24)
         cb.pack(side="left")
         cb.bind("<<ComboboxSelected>>", self._on_provider_change)
+        self._refresh_provider_list()
         self._entry(bar, "Symbols", self.v_symbols, 26)
         self._entry(bar, "Focus", self.v_focus, 7).bind("<Return>", self._apply_focus)
         self._entry(bar, "Every (s)", self.v_interval, 4)
@@ -145,6 +150,8 @@ class App(tk.Tk):
         ttk.Button(ai_row, text="↻", width=3, command=self.refresh_models).pack(side="left", padx=4)
         ttk.Label(ai_row, textvariable=self.v_ai_status, style="Muted.TLabel").pack(side="left", padx=6)
         ttk.Button(ai_row, text="Save", command=self.on_save).pack(side="right", padx=10)
+        ttk.Checkbutton(ai_row, text="Show personal-use-only sources (Yahoo)", variable=self.v_show_personal,
+                        command=self._refresh_provider_list).pack(side="right", padx=(0, 10))
         ttk.Checkbutton(ai_row, text="Remember keys (OS keychain)" if keyring_available()
                         else "Remember keys (unavailable — use .env)", variable=self.v_remember).pack(side="right")
 
@@ -260,6 +267,8 @@ class App(tk.Tk):
             model=self.v_model.get().strip() or llm.DEFAULT_MODEL,
             ollama_host=normalize_host(self.v_host.get()),
             remember=bool(self.v_remember.get()),
+            show_personal_sources=bool(self.v_show_personal.get()),
+            first_run_done=True,
             creds={k: v.get().strip() for k, v in self.v_creds.items()},
         )
 
@@ -340,9 +349,18 @@ class App(tk.Tk):
         )
 
     # ================================================================ data actions
+    def _refresh_provider_list(self) -> None:
+        specs = visible_providers(bool(self.v_show_personal.get()), self._provider_id())
+        self.cb_provider.configure(values=[sp.label for sp in specs])
+
     def _on_provider_change(self, _evt=None) -> None:
         self._render_provider_panel()
         spec = PROVIDERS[self._provider_id()]
+        if spec.market != self._market:  # stocks <-> crypto: swap in sensible symbols
+            self.v_symbols.set(spec.default_symbols)
+            self.v_focus.set(spec.default_symbols.split()[0])
+            self._market = spec.market
+        self._refresh_provider_list()
         if spec.fields and not all(self.v_creds[f.key].get().strip() for f in spec.fields if f.secret):
             self._toggle_settings(True)
         if self.poller:
@@ -381,7 +399,7 @@ class App(tk.Tk):
                      f"instead of {s.interval}s.", "warn")
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-        self.telemetry = TelemetryStore()
+        self.telemetry = TelemetryStore(market=spec.market, clip_volume=spec.clip_volume_spikes)
         self.poller = Poller(provider, s.symbols.replace(",", " ").split(), s.focus, interval,
                              self.events, self.telemetry, bars_every=max(spec.min_bars_every, interval))
         self.poller.start()
@@ -526,6 +544,55 @@ class App(tk.Tk):
                          title=f"{'Auto ' if auto else ''}Analysis {focus}", ctx=ctx)
 
         self._when_ready(focus, go)
+
+    # ---------- first run
+    def first_run_picker(self) -> None:
+        dlg = tk.Toplevel(self)
+        dlg.title("Welcome to QuantEcho")
+        dlg.configure(bg=C["panel"])
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        ttk.Label(dlg, text="Pick a market-data source", style="H.TLabel").pack(padx=24, pady=(18, 4))
+        ttk.Label(dlg, text="You can change this any time from the Source menu.",
+                  style="Muted.TLabel").pack(padx=24, pady=(0, 12))
+        choices = [
+            ("coinbase", "Crypto — live, no signup",
+             "Real-time BTC, ETH, SOL… from Coinbase's free public API."),
+            ("alpaca", "US stocks — free Alpaca key (≈2 min)",
+             "Real-time stock quotes + 1-min bars. Sign up free at alpaca.markets, paste the key."),
+            ("simulated", "Demo mode — no internet",
+             "Fake prices to explore every feature. Not real data."),
+        ]
+
+        def choose(pid: str) -> None:
+            spec = PROVIDERS[pid]
+            self.v_provider.set(spec.label)
+            self._on_provider_change()
+            if spec.market == self._market and pid != "alpaca":
+                self.v_symbols.set(spec.default_symbols)
+                self.v_focus.set(spec.default_symbols.split()[0])
+            dlg.destroy()
+            self.on_save()
+            if pid == "alpaca":
+                self._toggle_settings(True)
+                self.log("[Setup] Paste your free Alpaca API Key ID + Secret in ⚙ Settings, click Save, "
+                         "then ▶ Start. ('get a key ↗' opens the signup page.)", "warn")
+            else:
+                self.on_start()
+
+        for pid, title, desc in choices:
+            box = ttk.Frame(dlg, padding=(12, 8))
+            box.pack(fill="x", padx=18, pady=4)
+            ttk.Button(box, text=title, width=38, command=lambda p=pid: choose(p)).pack(anchor="w")
+            ttk.Label(box, text=desc, style="Muted.TLabel", wraplength=360).pack(anchor="w", pady=(2, 0))
+        ttk.Label(dlg, text="Tip: Yahoo Finance (personal use only) can be enabled in ⚙ Settings.",
+                  style="Muted.TLabel").pack(padx=24, pady=(8, 16))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: choose("simulated"))
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + 120
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
 
     # ---------- auto-analyze / journal
     def _schedule_auto(self) -> None:
