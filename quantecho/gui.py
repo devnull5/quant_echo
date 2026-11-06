@@ -590,7 +590,10 @@ class App(tk.Tk):
         first_time = not self.settings.first_run_done
         ttk.Label(dlg, text="Welcome to QuantEcho" if first_time else "Pick a data source",
                   style="H.TLabel").pack(padx=24, pady=(16, 2))
-        ttk.Label(dlg, text="Choose where market data comes from. You can switch any time from the Source menu.",
+        hint = "Choose where market data comes from. You can switch any time from the Source menu."
+        if not first_time:
+            hint += "  ★ = your last source (Enter starts it)."
+        ttk.Label(dlg, text=hint,
                   style="Muted.TLabel", wraplength=440).pack(padx=24, pady=(0, 10))
 
         blurbs = {
@@ -624,9 +627,9 @@ class App(tk.Tk):
                 ttk.Label(grid, text="Other sources", style="Muted.TLabel").pack(anchor="w", pady=(10, 2))
             row = ttk.Frame(grid, padding=(0, 3))
             row.pack(fill="x")
-            tag = "  ★ last used" if sp.id == current and not first_time else ""
+            tag = " ★" if sp.id == current and not first_time else ""
             warn = "⚠ " if sp.personal_use_only else ""
-            btn = ttk.Button(row, text=f"{warn}{sp.label}{tag}", width=34, command=lambda p=sp.id: choose(p))
+            btn = ttk.Button(row, text=f"{warn}{sp.label}{tag}", width=40, command=lambda p=sp.id: choose(p))
             btn.pack(side="left")
             desc = blurbs.get(sp.id) or sp.notes.split(". ")[0]
             if needs_keys(sp):
