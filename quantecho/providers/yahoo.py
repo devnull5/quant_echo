@@ -6,6 +6,8 @@ Quotes use the batch `spark` endpoint (max 20 symbols per call) so a 21-symbol w
 """
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from ..models import Quote
@@ -14,7 +16,8 @@ from .base import Http, ProviderError, ProviderSpec, bar, latest_session, pct
 
 BASE = "https://query1.finance.yahoo.com/v8/finance"
 SPARK_MAX = 20          # Yahoo rejects larger batches with HTTP 400
-VOLUME_PER_POLL = 2     # extra chart calls per poll to fill in volume
+VOLUME_PER_POLL = 2     # chart calls per poll to keep volumes fresh once filled
+FILL_WORKERS = 6        # parallel chart calls when filling volumes for new symbols
 
 
 def to_yahoo(sym: str) -> str:
@@ -88,10 +91,23 @@ def parse_bars(payload: Any) -> List[Dict[str, Any]]:
 
 
 class YahooProvider:
+    # Shared across instances: the app creates a new provider on every Start / focus change, and
+    # volumes shouldn't be thrown away (and re-fetched) each time.
+    _volume_cache: Dict[str, float] = {}
+    _cache_lock = threading.Lock()
+
     def __init__(self, http: Optional[Http] = None):
         self.http = http or Http(BASE)
-        self._volume: Dict[str, float] = {}   # yahoo symbol -> latest daily volume
-        self._rot = 0                          # rotation cursor for volume refresh
+        self._rot = 0  # rotation cursor for volume refresh
+
+    def _fetch_volume(self, y: str) -> None:
+        try:
+            q = parse_quote(self.http.get(f"chart/{y}", {"interval": "1d", "range": "1d"}))
+        except ProviderError:
+            return  # volume is best-effort
+        if q.total_volume is not None:
+            with self._cache_lock:
+                self._volume_cache[y] = q.total_volume
 
     def get_quotes(self, symbols: List[str]) -> Dict[str, Quote]:
         ymap = {to_yahoo(s): s.upper() for s in symbols}   # yahoo spelling -> user's spelling
@@ -108,25 +124,24 @@ class YahooProvider:
         if not quotes:
             raise ProviderError("; ".join(errors) or "Yahoo: no quotes returned (unknown symbols?)")
 
-        # volume: refresh a couple of symbols per poll, preferring ones we've never filled
-        missing = [y for y in ysyms if y in quotes and y not in self._volume]
-        pool = missing or [y for y in ysyms if y in quotes]
-        budget = VOLUME_PER_POLL * (2 if missing else 1)  # fill a new watchlist faster, then trickle
-        for _ in range(min(budget, len(pool))):
-            y = pool[self._rot % len(pool)] if not missing else pool.pop(0)
-            self._rot += 1
-            try:
-                q = parse_quote(self.http.get(f"chart/{y}", {"interval": "1d", "range": "1d"}))
-                if q.total_volume is not None:
-                    self._volume[y] = q.total_volume
-            except ProviderError:
-                pass  # volume is best-effort
+        # volume: fill every never-seen symbol at once (in parallel), then refresh 2 per poll in rotation
+        have = [y for y in ysyms if y in quotes]
+        with self._cache_lock:
+            missing = [y for y in have if y not in self._volume_cache]
+        if missing:
+            with ThreadPoolExecutor(max_workers=min(FILL_WORKERS, len(missing))) as pool:
+                list(pool.map(self._fetch_volume, missing))
+        elif have:
+            for _ in range(min(VOLUME_PER_POLL, len(have))):
+                self._fetch_volume(have[self._rot % len(have)])
+                self._rot += 1
 
         out: Dict[str, Quote] = {}
         for y, q in quotes.items():
             user = ymap.get(y, y)
             q.symbol = user
-            q.total_volume = self._volume.get(y)
+            with self._cache_lock:
+                q.total_volume = self._volume_cache.get(y)
             out[user] = q
         return out
 

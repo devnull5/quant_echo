@@ -157,6 +157,7 @@ class TestProviders(unittest.TestCase):
         spark = {"SPY": {"symbol": "SPY", "fulldayPrice": 740.65, "previousClose": 733.0,
                          "fulldayChangePercent": 1.044, "timestamp": [1793978700, 1793978820],
                          "close": [740.1, 740.65]}}
+        YahooProvider._volume_cache.clear()
         p = YahooProvider(http=FakeHttp({"spark": spark, "chart/SPY": chart}))
         q = p.get_quotes(["spy"])["SPY"]
         self.assertEqual((q.last, q.net_pct, q.timestamp_ms, q.total_volume), (740.65, 1.044, 1793978820000, 14234102))
@@ -185,16 +186,26 @@ class TestProviders(unittest.TestCase):
                 return {"chart": {"result": [{"meta": {"symbol": y, "regularMarketPrice": 100.0,
                                                         "regularMarketVolume": 5000}}]}}
 
+        YahooProvider._volume_cache.clear()
         http = SparkHttp()
         p = YahooProvider(http=http)
         q = p.get_quotes(syms)
         self.assertEqual(len(q), 21)
         self.assertIn("BRK.B", q)                                    # keyed by the user's spelling
         self.assertEqual(sum(c[0] == "spark" for c in http.calls), 2)  # 21 symbols -> 2 batch calls
-        self.assertEqual(sum(c[0].startswith("chart/") for c in http.calls), 4)  # + 4 volume fills (first polls)
-        for _ in range(12):
-            q = p.get_quotes(syms)
-        self.assertTrue(all(v.total_volume == 5000 for v in q.values()))  # rotation fills all volumes
+        self.assertEqual(sum(c[0].startswith("chart/") for c in http.calls), 21)  # all volumes filled at once
+        self.assertTrue(all(v.total_volume == 5000 for v in q.values()))         # ...on the FIRST poll
+
+        http.calls.clear()
+        p.get_quotes(syms)
+        self.assertEqual(sum(c[0].startswith("chart/") for c in http.calls), 2)   # then gentle 2-per-poll refresh
+
+        # restart (new provider, e.g. focus change): cache survives, no re-fill burst
+        http2 = SparkHttp()
+        q2 = YahooProvider(http=http2).get_quotes(syms)
+        self.assertTrue(all(v.total_volume == 5000 for v in q2.values()))
+        self.assertEqual(sum(c[0].startswith("chart/") for c in http2.calls), 2)
+        YahooProvider._volume_cache.clear()
 
     def test_interval_scales_with_watchlist(self):
         self.assertEqual(PROVIDERS["yahoo"].interval_for(21, 20), 20)       # batched
