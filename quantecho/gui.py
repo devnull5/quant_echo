@@ -132,7 +132,7 @@ class App(tk.Tk):
         self._entry(bar, "Symbols", self.v_symbols, 26)
         self._entry(bar, "Focus", self.v_focus, 7).bind("<Return>", self._apply_focus)
         self._entry(bar, "Every (s)", self.v_interval, 4)
-        ttk.Button(bar, text="▶ Start", command=self.on_start).pack(side="left", padx=(12, 4))
+        ttk.Button(bar, text="▶ Start", command=self.on_start_clicked).pack(side="left", padx=(12, 4))
         ttk.Button(bar, text="■ Stop", command=self.on_stop).pack(side="left")
         ttk.Button(bar, text="⚙ Settings", command=self._toggle_settings).pack(side="left", padx=(12, 0))
         ttk.Label(bar, textvariable=self.v_status, style="Muted.TLabel").pack(side="right", padx=10)
@@ -310,6 +310,8 @@ class App(tk.Tk):
                     self.log(f"[{self._ts()}] ⚡ {payload.text}", payload.kind if payload.kind != "info" else "muted")
                 elif kind == "quotes":
                     self._refresh_table()
+                    if self.poller:
+                        self.v_status.set(f"{self._status_base} · updated {time.strftime('%H:%M:%S')}")
                 elif kind == "models":
                     self._apply_models(payload)
         except queue.Empty:
@@ -390,6 +392,13 @@ class App(tk.Tk):
             where = "OS keychain" if self.settings.remember else "not stored (Remember keys is off)"
             self.log(f"[{self._ts()}] Settings saved. Keys: {where}.")
 
+    def on_start_clicked(self) -> None:
+        """Toolbar button: start, or restart with the current settings if already running."""
+        if self.poller and self.poller.is_alive():
+            self.log(f"[{self._ts()}] Already running — restarting with current settings.", "muted")
+            self.on_stop()
+        self.on_start()
+
     def on_start(self) -> None:
         if self.poller and self.poller.is_alive():
             return
@@ -415,7 +424,8 @@ class App(tk.Tk):
                              self.events, self.telemetry, bars_every=max(spec.min_bars_every, interval))
         self.poller.start()
         filelog.info(f"Start provider={s.provider} focus={s.focus} symbols={s.symbols!r} interval={interval}s")
-        self.v_status.set(f"Live · {spec.label} · {s.focus}")
+        self._status_base = f"Live · {spec.label} · {s.focus}"
+        self.v_status.set(self._status_base + " · connecting…")
 
     def on_stop(self) -> None:
         if self.poller:
