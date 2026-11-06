@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -31,6 +32,8 @@ C = {
 }
 
 LABEL_TO_ID = {spec.label: pid for pid, spec in PROVIDERS.items()}
+_BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
+_HEAD = re.compile(r"^(#{1,4} )", re.M)
 
 
 def _f(x, nd=2, suffix=""):
@@ -120,7 +123,7 @@ class App(tk.Tk):
         cb.pack(side="left")
         cb.bind("<<ComboboxSelected>>", self._on_provider_change)
         self._entry(bar, "Symbols", self.v_symbols, 26)
-        self._entry(bar, "Focus", self.v_focus, 7)
+        self._entry(bar, "Focus", self.v_focus, 7).bind("<Return>", self._apply_focus)
         self._entry(bar, "Every (s)", self.v_interval, 4)
         ttk.Button(bar, text="▶ Start", command=self.on_start).pack(side="left", padx=(12, 4))
         ttk.Button(bar, text="■ Stop", command=self.on_stop).pack(side="left")
@@ -172,6 +175,8 @@ class App(tk.Tk):
         self.text.tag_configure("a", foreground="#e3d7a3")
         self.text.tag_configure("warn", foreground=C["warn"])
         self.text.tag_configure("muted", foreground=C["muted"])
+        self.text.tag_configure("bold", font=("Consolas", 10, "bold"), foreground="#f5ecc2")
+        self.text.tag_raise("bold")
         self.text.tag_configure("bull", foreground=C["up"])
         self.text.tag_configure("bear", foreground=C["down"])
         self.text.pack(fill="both", expand=True)
@@ -266,6 +271,8 @@ class App(tk.Tk):
                     self.text.insert("end", "\n")
                     self.text.mark_set("ai", "end-2c")
                     self.text.mark_gravity("ai", "right")
+                    self.text.mark_set("ai_begin", "end-2c")
+                    self.text.mark_gravity("ai_begin", "left")
                     self.text.see("end")
                 elif kind == "ai_tok":
                     self.text.insert("ai", payload, "a")
@@ -273,6 +280,7 @@ class App(tk.Tk):
                 elif kind == "ai_think":
                     self.v_ai_live.set(f"thinking… ~{payload // 4} tok")
                 elif kind == "ai_done":
+                    self._render_markdown("ai_begin", "ai")
                     self.text.insert("ai", payload, "muted")
                     self.text.see("end")
                     self.v_ai_live.set("")
@@ -286,6 +294,21 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._pump)
+
+    def _render_markdown(self, start: str, end: str) -> None:
+        """Turn **bold** into a bold tag and '### Heading' into a heading, removing the markers."""
+        body = self.text.get(start, end)
+        spans = [(m.start(), m.end(), 2, "bold") for m in _BOLD.finditer(body)]
+        spans += [(m.start(), m.end(), len(m.group(1)), "head") for m in _HEAD.finditer(body)]
+        for s, e, n, tag in sorted(spans, reverse=True):  # back to front keeps offsets valid
+            a, b = f"{start}+{s}c", f"{start}+{e}c"
+            if tag == "bold":
+                self.text.delete(f"{start}+{e - 2}c", b)
+                self.text.delete(a, f"{start}+{s + 2}c")
+                self.text.tag_add("bold", a, f"{start}+{e - 4}c")
+            else:
+                self.text.delete(a, f"{start}+{s + n}c")
+                self.text.tag_add("bold", a, f"{a} lineend")
 
     def _refresh_table(self) -> None:
         if not self.poller:
@@ -427,32 +450,67 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _apply_focus(self, _evt=None) -> str:
+        """Make the Focus field authoritative: if polling a different symbol, switch to it now."""
+        new = (self.v_focus.get().strip() or "SPY").upper()
+        self.v_focus.set(new)
+        if self.poller and self.poller.focus != new:
+            self.on_stop()
+            self.on_start()
+        return new
+
+    def _when_ready(self, focus: str, callback, tries: int = 30) -> None:
+        """Call callback(ctx) once telemetry for `focus` exists (polls up to ~15 s while running)."""
+        ctx = self.telemetry.context(focus)
+        if ctx or tries <= 0 or not self.poller:
+            callback(ctx or "")
+            return
+        if tries == 30:
+            self.v_ai_live.set(f"waiting for {focus} data…")
+        self.after(500, lambda: self._when_ready(focus, callback, tries - 1))
+
     def on_ask(self) -> None:
         q = self.v_question.get().strip()
         if not q or str(self.btn_ask.cget("state")) == "disabled":
             return
+        focus = self._apply_focus()
         self.log(f"[{self._ts()}] Q> {q}", "q")
-        prompt, ctx = q, ""
-        if self.v_with_ctx.get():
-            ctx = self.telemetry.context(self._collect().focus) or ""
+        self._ai_busy(True)
+
+        def go(ctx: str) -> None:
+            prompt = f"Focus symbol: {focus}\n\n{q}"
             if ctx:
-                prompt = f"{q}\n\nTelemetry:\n{ctx}"
-            else:
-                self.log("[AI] No telemetry yet; asking without market context.")
-        self._run_ai(prompt, title=f"Q: {q[:80]}", ctx=ctx)
+                prompt += f"\n\nTelemetry:\n{ctx}"
+            elif self.v_with_ctx.get():
+                self.log(f"[AI] No {focus} telemetry (press Start for live data); answering without it.")
+            self._run_ai(prompt, title=f"Q ({focus}): {q[:80]}", ctx=ctx)
+
+        if self.v_with_ctx.get():
+            self._when_ready(focus, go)
+        else:
+            go("")
 
     def on_analyze(self, auto: bool = False) -> None:
         if str(self.btn_analyze.cget("state")) == "disabled":
             return
-        focus = self.poller.focus if self.poller else self._collect().focus
-        ctx = self.telemetry.context(focus)
-        if not ctx:
+        focus = self._apply_focus()
+        if not self.poller:
             if not auto:
-                self.log("[AI] No telemetry yet — press Start first.")
+                self.log("[AI] Press ▶ Start first — analysis needs live data.")
             return
-        self.log(f"[{self._ts()}] {'Auto-a' if auto else 'A'}nalyzing {focus} with {self.v_model.get()}…", "q")
-        self._run_ai(llm.ANALYZE_TEMPLATE.format(ctx=ctx), think=True,
-                     title=f"{'Auto ' if auto else ''}Analysis {focus}", ctx=ctx)
+        self._ai_busy(True)
+
+        def go(ctx: str) -> None:
+            if not ctx:
+                self._ai_busy(False)
+                self.v_ai_live.set("")
+                self.log(f"[AI] No {focus} data came back from {PROVIDERS[self._provider_id()].label}.", "warn")
+                return
+            self.log(f"[{self._ts()}] {'Auto-a' if auto else 'A'}nalyzing {focus} with {self.v_model.get()}…", "q")
+            self._run_ai(llm.ANALYZE_TEMPLATE.format(ctx=ctx), think=True,
+                         title=f"{'Auto ' if auto else ''}Analysis {focus}", ctx=ctx)
+
+        self._when_ready(focus, go)
 
     # ---------- auto-analyze / journal
     def _schedule_auto(self) -> None:
