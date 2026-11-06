@@ -54,10 +54,21 @@ class TestGuiSmoke(unittest.TestCase):
         self.pump(0.3)
 
     def tearDown(self):
+        import gc
+        import threading
         try:
             self.app._on_close()
         except Exception:
             pass
+        # Let this test's polling threads finish, then free its Tk objects HERE on the main thread.
+        # Otherwise leftover Tk Variables/Images get garbage-collected later on some background thread;
+        # on Python 3.10 each such __del__ makes Tcl wait for the main loop ("main thread is not in main
+        # loop"), which can stall the next test's poller for seconds.
+        for t in threading.enumerate():
+            if t.name == "quantecho-poller":
+                t.join(timeout=5)
+        del self.app
+        gc.collect()
         for p in self.patches:
             p.stop()
 
