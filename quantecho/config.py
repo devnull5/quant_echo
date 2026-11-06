@@ -36,6 +36,7 @@ class Settings:
     remember: bool = True
     show_personal_sources: bool = False  # list Yahoo etc. (unofficial / personal-use-only terms)
     first_run_done: bool = False
+    ask_source_on_launch: bool = True  # show the source picker every launch (has a "don't ask again" box)
     creds: Dict[str, str] = field(default_factory=dict)
 
 
@@ -87,7 +88,7 @@ def load_settings(path: Path = SETTINGS_PATH) -> Settings:
             except (TypeError, ValueError):
                 continue
         setattr(s, name, str(val) if name != "interval" else val)
-    for flag in ("remember", "show_personal_sources", "first_run_done"):
+    for flag in ("remember", "show_personal_sources", "first_run_done", "ask_source_on_launch"):
         if flag in saved:
             setattr(s, flag, bool(saved[flag]))
     if s.provider not in PROVIDERS:

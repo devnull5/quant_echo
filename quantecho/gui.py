@@ -64,6 +64,7 @@ class App(tk.Tk):
         self.v_host = tk.StringVar(value=s.ollama_host)
         self.v_remember = tk.BooleanVar(value=s.remember)
         self.v_show_personal = tk.BooleanVar(value=s.show_personal_sources)
+        self.v_ask_launch = tk.BooleanVar(value=s.ask_source_on_launch)
         self._market = PROVIDERS[s.provider].market
         self.v_creds: Dict[str, tk.StringVar] = {f.key: tk.StringVar(value=s.creds.get(f.key, f.default))
                                                  for f in all_fields()}
@@ -82,8 +83,8 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._pump)
         self.after(300, self.refresh_models)
-        if not s.first_run_done:
-            self.after(400, self.first_run_picker)
+        if s.ask_source_on_launch or not s.first_run_done:
+            self.after(400, self.source_picker)
 
     # ================================================================ layout
     def _style(self) -> None:
@@ -150,6 +151,8 @@ class App(tk.Tk):
         ttk.Button(ai_row, text="↻", width=3, command=self.refresh_models).pack(side="left", padx=4)
         ttk.Label(ai_row, textvariable=self.v_ai_status, style="Muted.TLabel").pack(side="left", padx=6)
         ttk.Button(ai_row, text="Save", command=self.on_save).pack(side="right", padx=10)
+        ttk.Checkbutton(ai_row, text="Ask for source on launch", variable=self.v_ask_launch,
+                        command=self.on_save).pack(side="right", padx=(0, 10))
         ttk.Checkbutton(ai_row, text="Show personal-use-only sources (Yahoo)", variable=self.v_show_personal,
                         command=self._refresh_provider_list).pack(side="right", padx=(0, 10))
         ttk.Checkbutton(ai_row, text="Remember keys (OS keychain)" if keyring_available()
@@ -269,6 +272,7 @@ class App(tk.Tk):
             remember=bool(self.v_remember.get()),
             show_personal_sources=bool(self.v_show_personal.get()),
             first_run_done=True,
+            ask_source_on_launch=bool(self.v_ask_launch.get()),
             creds={k: v.get().strip() for k, v in self.v_creds.items()},
         )
 
@@ -546,52 +550,82 @@ class App(tk.Tk):
 
         self._when_ready(focus, go)
 
-    # ---------- first run
-    def first_run_picker(self) -> None:
+    # ---------- source picker (every launch unless turned off)
+    FEATURED = ("coinbase", "alpaca", "simulated")
+
+    def source_picker(self) -> None:
         dlg = tk.Toplevel(self)
-        dlg.title("Welcome to QuantEcho")
+        dlg.title("QuantEcho — pick a data source")
         dlg.configure(bg=C["panel"])
         dlg.transient(self)
         dlg.resizable(False, False)
-        ttk.Label(dlg, text="Pick a market-data source", style="H.TLabel").pack(padx=24, pady=(18, 4))
-        ttk.Label(dlg, text="You can change this any time from the Source menu.",
-                  style="Muted.TLabel").pack(padx=24, pady=(0, 12))
-        choices = [
-            ("coinbase", "Crypto — live, no signup",
-             "Real-time BTC, ETH, SOL… from Coinbase's free public API."),
-            ("alpaca", "US stocks — free Alpaca key (≈2 min)",
-             "Real-time stock quotes + 1-min bars. Sign up free at alpaca.markets, paste the key."),
-            ("simulated", "Demo mode — no internet",
-             "Fake prices to explore every feature. Not real data."),
-        ]
+        current = self._provider_id()
+        first_time = not self.settings.first_run_done
+        ttk.Label(dlg, text="Welcome to QuantEcho" if first_time else "Pick a data source",
+                  style="H.TLabel").pack(padx=24, pady=(16, 2))
+        ttk.Label(dlg, text="Choose where market data comes from. You can switch any time from the Source menu.",
+                  style="Muted.TLabel", wraplength=440).pack(padx=24, pady=(0, 10))
+
+        blurbs = {
+            "coinbase": "Live crypto (BTC, ETH, SOL…) — no signup",
+            "alpaca": "US stocks, real-time — free key (≈2 min signup)",
+            "simulated": "Demo mode — fake prices, no internet",
+        }
+        visible = visible_providers(bool(self.v_show_personal.get()), current)
+        ordered = [sp for pid in self.FEATURED for sp in visible if sp.id == pid] +                   [sp for sp in visible if sp.id not in self.FEATURED]
+
+        def needs_keys(sp) -> bool:
+            return any(f.secret and not self.v_creds[f.key].get().strip() for f in sp.fields)
 
         def choose(pid: str) -> None:
             spec = PROVIDERS[pid]
             self.v_provider.set(spec.label)
             self._on_provider_change()
-            if spec.market == self._market and pid != "alpaca":
-                self.v_symbols.set(spec.default_symbols)
-                self.v_focus.set(spec.default_symbols.split()[0])
             dlg.destroy()
             self.on_save()
-            if pid == "alpaca":
+            if needs_keys(spec):
                 self._toggle_settings(True)
-                self.log("[Setup] Paste your free Alpaca API Key ID + Secret in ⚙ Settings, click Save, "
-                         "then ▶ Start. ('get a key ↗' opens the signup page.)", "warn")
+                self.log(f"[Setup] {spec.label} needs a free API key: paste it in ⚙ Settings ('get a key ↗' opens "
+                         "the signup page), click Save, then ▶ Start.", "warn")
             else:
                 self.on_start()
 
-        for pid, title, desc in choices:
-            box = ttk.Frame(dlg, padding=(12, 8))
-            box.pack(fill="x", padx=18, pady=4)
-            ttk.Button(box, text=title, width=38, command=lambda p=pid: choose(p)).pack(anchor="w")
-            ttk.Label(box, text=desc, style="Muted.TLabel", wraplength=360).pack(anchor="w", pady=(2, 0))
-        ttk.Label(dlg, text="Tip: Yahoo Finance (personal use only) can be enabled in ⚙ Settings.",
-                  style="Muted.TLabel").pack(padx=24, pady=(8, 16))
-        dlg.protocol("WM_DELETE_WINDOW", lambda: choose("simulated"))
+        grid = ttk.Frame(dlg, padding=(18, 0))
+        grid.pack(fill="x")
+        for i, sp in enumerate(ordered):
+            if i == len(self.FEATURED) and len(ordered) > i:
+                ttk.Label(grid, text="Other sources", style="Muted.TLabel").pack(anchor="w", pady=(10, 2))
+            row = ttk.Frame(grid, padding=(0, 3))
+            row.pack(fill="x")
+            tag = "  ★ last used" if sp.id == current and not first_time else ""
+            warn = "⚠ " if sp.personal_use_only else ""
+            btn = ttk.Button(row, text=f"{warn}{sp.label}{tag}", width=34, command=lambda p=sp.id: choose(p))
+            btn.pack(side="left")
+            desc = blurbs.get(sp.id) or sp.notes.split(". ")[0]
+            if needs_keys(sp):
+                desc += "  · key needed"
+            ttk.Label(row, text=desc, style="Muted.TLabel", wraplength=300).pack(side="left", padx=10)
+            if sp.id == current:
+                btn.focus_set()
+                dlg.bind("<Return>", lambda _e, p=sp.id: choose(p))
+
+        foot = ttk.Frame(dlg, padding=(18, 12))
+        foot.pack(fill="x")
+        ttk.Checkbutton(foot, text="Don't ask again (turn back on in ⚙ Settings)",
+                        variable=self.v_ask_launch, onvalue=False, offvalue=True).pack(side="left")
+        if not self.v_show_personal.get():
+            ttk.Label(dlg, text="Yahoo Finance (personal use only) can be enabled in ⚙ Settings.",
+                      style="Muted.TLabel").pack(padx=24, pady=(0, 12))
+
+        def dismiss(_e=None) -> None:  # keep current source, don't auto-start
+            dlg.destroy()
+            self.on_save()
+
+        dlg.protocol("WM_DELETE_WINDOW", dismiss)
+        dlg.bind("<Escape>", dismiss)
         dlg.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
-        y = self.winfo_rooty() + 120
+        y = self.winfo_rooty() + 100
         dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
         dlg.grab_set()
 

@@ -636,6 +636,13 @@ class TestCryptoAndStoreSafety(unittest.TestCase):
             self.assertTrue(s.show_personal_sources)
             self.assertTrue(s.first_run_done)            # existing user: no welcome picker
 
+    def test_ask_source_on_launch_persists(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.json"
+            self.assertTrue(load_settings(path).ask_source_on_launch)          # default: ask every launch
+            save_settings(Settings(ask_source_on_launch=False, first_run_done=True), path)
+            self.assertFalse(load_settings(path).ask_source_on_launch)
+
     def test_new_user_sees_picker(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict("os.environ", {"DATA_PROVIDER": ""}):
             s = load_settings(Path(d) / "missing.json")
