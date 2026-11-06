@@ -26,7 +26,8 @@ DEFAULT_PROVIDER = "simulated"  # never opens to an error; first-run picker offe
 
 def visible_providers(show_personal: bool, current: str = "") -> List[ProviderSpec]:
     """Sources to list in the UI: personal-use-only ones only when opted in (or already selected)."""
-    return [s for s in PROVIDERS.values() if show_personal or not s.personal_use_only or s.id == current]
+    return [s for s in PROVIDERS.values()
+            if s.available() and (show_personal or not s.personal_use_only or s.id == current)]
 
 
 def all_fields() -> List[Field]:

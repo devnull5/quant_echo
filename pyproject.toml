@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quantecho"
-version = "0.4.0"
+version = "0.5.0"
 description = "Desktop market-data dashboard with intraday TA and local-LLM (Ollama) analysis. Read-only; never trades."
 readme = "README.md"
 license = "MIT"
@@ -39,6 +39,9 @@ quantecho-auth = "quantecho.auth:main"
 
 [tool.setuptools.packages.find]
 include = ["quantecho*"]
+
+[tool.setuptools.package-data]
+quantecho = ["assets/*.png"]
 
 [tool.ruff]
 line-length = 120

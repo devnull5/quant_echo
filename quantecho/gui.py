@@ -8,6 +8,7 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
+from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Dict, Optional
 
@@ -48,6 +49,7 @@ class App(tk.Tk):
         self.geometry("1220x820")
         self.minsize(960, 620)
         self.configure(bg=C["bg"])
+        self._set_icon()
         self._style()
 
         self.settings = load_settings()
@@ -81,12 +83,20 @@ class App(tk.Tk):
         self._build()
         self._render_provider_panel()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(100, self._pump)
+        self._pump_job: Optional[str] = self.after(100, self._pump)
         self.after(300, self.refresh_models)
         if s.ask_source_on_launch or not s.first_run_done:
             self.after(400, self.source_picker)
 
     # ================================================================ layout
+    def _set_icon(self) -> None:
+        icon = Path(__file__).resolve().parent / "assets" / "icon.png"
+        try:
+            self._icon_img = tk.PhotoImage(file=str(icon))  # keep a reference or Tk drops it
+            self.iconphoto(True, self._icon_img)
+        except (tk.TclError, OSError):
+            pass  # cosmetic only
+
     def _style(self) -> None:
         st = ttk.Style(self)
         try:
@@ -130,7 +140,7 @@ class App(tk.Tk):
         cb.bind("<<ComboboxSelected>>", self._on_provider_change)
         self._refresh_provider_list()
         self._entry(bar, "Symbols", self.v_symbols, 26)
-        self._entry(bar, "Focus", self.v_focus, 7).bind("<Return>", self._apply_focus)
+        self._entry(bar, "Focus", self.v_focus, 9).bind("<Return>", self._apply_focus)
         self._entry(bar, "Every (s)", self.v_interval, 4)
         ttk.Button(bar, text="▶ Start", command=self.on_start_clicked).pack(side="left", padx=(12, 4))
         ttk.Button(bar, text="■ Stop", command=self.on_stop).pack(side="left")
@@ -316,7 +326,7 @@ class App(tk.Tk):
                     self._apply_models(payload)
         except queue.Empty:
             pass
-        self.after(100, self._pump)
+        self._pump_job = self.after(100, self._pump)
 
     def _render_markdown(self, start: str, end: str) -> None:
         """Turn **bold** into a bold tag and '### Heading' into a heading, removing the markers."""
@@ -424,7 +434,7 @@ class App(tk.Tk):
                              self.events, self.telemetry, bars_every=max(spec.min_bars_every, interval))
         self.poller.start()
         filelog.info(f"Start provider={s.provider} focus={s.focus} symbols={s.symbols!r} interval={interval}s")
-        self._status_base = f"Live · {spec.label} · {s.focus}"
+        self._status_base = f"Live · {spec.label.split(' (')[0]} · {s.focus}"
         self.v_status.set(self._status_base + " · connecting…")
 
     def on_stop(self) -> None:
@@ -694,10 +704,20 @@ class App(tk.Tk):
 
     def _on_close(self) -> None:
         self.on_stop()
+        for job in (getattr(self, "_pump_job", None), getattr(self, "_auto_job", None)):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
         self.destroy()
 
 
 def main() -> None:
+    import sys
+    if "--selftest" in sys.argv:
+        from . import selftest
+        sys.exit(selftest.run(sys.argv))
     path = logsetup.setup()
     filelog.info(f"QuantEcho starting (log: {path})")
     App().mainloop()

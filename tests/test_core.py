@@ -679,6 +679,13 @@ class TestCryptoAndStoreSafety(unittest.TestCase):
         self.assertFalse(PROVIDERS[DEFAULT_PROVIDER].personal_use_only)
         self.assertFalse(PROVIDERS[DEFAULT_PROVIDER].fields)       # default works with zero setup
 
+    def test_sources_needing_missing_packages_are_hidden(self):
+        from quantecho.providers import PROVIDERS, visible_providers
+        with mock.patch("importlib.util.find_spec", return_value=None):
+            self.assertFalse(PROVIDERS["schwab"].available())
+            self.assertNotIn("schwab", [s.id for s in visible_providers(True)])
+            self.assertTrue(PROVIDERS["coinbase"].available())   # no extra package needed
+
     def test_existing_yahoo_user_keeps_yahoo(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "s.json"

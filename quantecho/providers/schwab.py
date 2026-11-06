@@ -105,4 +105,5 @@ SPEC = ProviderSpec(
           "Run `python -m quantecho.auth` first; token lasts 7 days.",
     min_interval=2,
     signup_url="https://developer.schwab.com",
+    requires="schwab",  # schwab-py; not bundled in the packaged app (its login needs a terminal)
 )

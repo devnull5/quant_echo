@@ -57,6 +57,13 @@ class ProviderSpec:
             need = n_symbols * self.calls_per_symbol * 60.0 / self.max_calls_per_min
         return int(max(requested, self.min_interval, -(-need // 1)))
     clip_volume_spikes: bool = False  # cap absurd single-bar volume (for feeds known to glitch)
+    requires: str = ""               # optional Python package this source needs (hidden if not installed)
+
+    def available(self) -> bool:
+        if not self.requires:
+            return True
+        import importlib.util
+        return importlib.util.find_spec(self.requires) is not None
 
 
 class ProviderError(RuntimeError):

@@ -28,7 +28,16 @@ jobs:
           python -m pip install -e . ruff
       - name: Lint
         run: ruff check --select F,E9,B quantecho tests
-      - name: Unit tests (offline, no keys)
-        run: python -m unittest discover -s tests -v
+      - name: Virtual display for GUI tests (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q xvfb
+      - name: Unit + GUI smoke tests (offline, no keys)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a python -m unittest discover -s tests -v
+          else
+            python -m unittest discover -s tests -v
+          fi
       - name: Package builds
         run: python -m pip wheel . --no-deps -w dist

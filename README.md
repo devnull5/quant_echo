@@ -140,6 +140,19 @@ python -m unittest discover -s tests -v
 
 Every provider is tested against recorded response shapes — no network or keys needed.
 
+## Windows app / Microsoft Store package
+
+```powershell
+.venv\Scripts\pip install pyinstaller pillow
+powershell -ExecutionPolicy Bypass -File packaging\build_msix.ps1      # -> build\msix\QuantEcho_<ver>_x64.msix
+powershell -ExecutionPolicy Bypass -File packaging\install_dev.ps1     # local test install (Developer Mode)
+```
+
+The build makes a standalone app (no Python needed), runs its built-in self-test
+(`QuantEcho.exe --selftest`), and packs an MSIX that the Store signs on submission. Listing text,
+certification notes and screenshots are in [`packaging/STORE_LISTING.md`](packaging/STORE_LISTING.md)
+and `packaging/store/`. Privacy policy: [PRIVACY.md](PRIVACY.md).
+
 ## Contributing
 
 PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md), especially for adding a new data provider.
