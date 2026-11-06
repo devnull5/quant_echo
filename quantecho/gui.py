@@ -479,7 +479,8 @@ class App(tk.Tk):
                     note = " · journaled"
                 except OSError:
                     pass
-            self.events.put(("ai_done", f"\n  ({time.monotonic() - t0:.0f}s{speed}{note})"))
+            # trailing newline -> blank line before whatever gets logged next
+            self.events.put(("ai_done", f"\n  ({time.monotonic() - t0:.0f}s{speed}{note})\n"))
 
         threading.Thread(target=worker, daemon=True).start()
 

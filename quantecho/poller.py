@@ -43,6 +43,7 @@ class Poller(threading.Thread):
         self._streak = 0               # consecutive failed quote polls
         self._last_err: Optional[str] = None
         self._next_wait: float = float(self.interval)
+        self._bars_state: Optional[str] = None  # last reported: live / stale / prior / none
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -124,12 +125,25 @@ class Poller(threading.Thread):
             self.events.put(("quotes", None))
         # back off when there is no data (off-hours, auth trouble)
         self._next_bars = time.monotonic() + (self.bars_every if bars else max(self.bars_every, 300))
+        # Only surface bar status when it CHANGES (first load, live -> stale, prior session, none);
+        # routine refreshes every minute go to the log file only.
         if bars:
             ts = datetime.fromtimestamp(bars[-1]["t"] / 1000, tz=timezone.utc).astimezone()
-            stale = "" if ts.date() == datetime.now().astimezone().date() else " (prior session)"
-            self.log(f"Bars: {self.focus} {len(bars)}x1m through {ts:%Y-%m-%d %H:%M}{stale}")
+            age_min = (datetime.now().astimezone() - ts).total_seconds() / 60
+            if ts.date() != datetime.now().astimezone().date():
+                state, note = "prior", " (prior session)"
+            elif age_min > 15:
+                state, note = "stale", f" (no new bars for {age_min:.0f} min)"
+            else:
+                state, note = "live", ""
+            msg = f"Bars: {self.focus} {len(bars)}x1m through {ts:%Y-%m-%d %H:%M}{note}"
         else:
-            self.log(f"Bars: {self.focus} none returned")
+            state, msg = "none", f"Bars: {self.focus} none returned"
+        if state != self._bars_state:
+            self.log(msg)
+            self._bars_state = state
+        else:
+            filelog.debug(msg)
 
     def run(self) -> None:
         self.log(f"Polling started — focus={self.focus} symbols={self.symbols} every {self.interval}s")

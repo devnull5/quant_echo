@@ -648,5 +648,23 @@ def time_now_ms():
     return _t.time() * 1000
 
 
+class TestQuietBarsLog(unittest.TestCase):
+    def test_bars_line_only_on_change(self):
+        ev = queue.Queue()
+        p = Poller(SimulatedProvider(seed=2), ["SPY"], "SPY", 1, ev, TelemetryStore())
+        for _ in range(3):
+            p._refresh_bars()
+        logs = [ev.get_nowait()[1] for _ in range(ev.qsize()) if True]
+        self.assertEqual(sum("Bars:" in str(m) for m in logs), 1)   # first load only, not every refresh
+
+        class Empty(SimulatedProvider):
+            def get_session_minute_bars(self, s):
+                return []
+        p.provider = Empty()
+        p._refresh_bars()
+        logs = [ev.get_nowait()[1] for _ in range(ev.qsize())]
+        self.assertTrue(any("none returned" in str(m) for m in logs))  # state change IS reported
+
+
 if __name__ == "__main__":
     unittest.main()
