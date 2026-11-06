@@ -1,7 +1,8 @@
 """Settings: the user's saved settings file first, falling back to .env / environment.
 
 Provider credentials live in `creds` (keys defined by each provider's Field list).
-Secret fields are only written to disk when "Remember keys" is ticked.
+Secret fields are stored in the OS keyring (Windows Credential Manager / macOS Keychain /
+Secret Service) only when "Remember keys" is ticked, and never in the JSON settings file.
 """
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, List, Optional
 
 try:
     from dotenv import load_dotenv
@@ -92,17 +93,83 @@ def load_settings(path: Path = SETTINGS_PATH) -> Settings:
 
     saved_creds = saved.get("creds") if isinstance(saved.get("creds"), dict) else {}
     for f in all_fields():
-        # also accept old flat keys (schwab_app_key etc.) from earlier versions
-        val = _pick(saved_creds.get(f.key) or saved.get(f.key), f.env)
+        # precedence: OS keyring -> settings file (older versions stored secrets there) -> env/.env -> default
+        stored = secret_get(f.key) if f.secret else None
+        val = _pick(stored or saved_creds.get(f.key) or saved.get(f.key), f.env)
         s.creds[f.key] = str(val) if val is not None else f.default
     return s
 
 
-def save_settings(s: Settings, path: Path = SETTINGS_PATH) -> None:
+# ---------------------------------------------------------------- OS keyring for secrets
+
+KEYRING_SERVICE = "quantecho"
+_keyring: Any = None  # tests may inject a fake
+
+
+def _kr() -> Any:
+    global _keyring
+    if _keyring is None:
+        try:
+            import keyring  # Windows Credential Manager / macOS Keychain / Secret Service
+
+            _keyring = keyring
+        except ImportError:
+            _keyring = False
+    return _keyring or None
+
+
+def keyring_available() -> bool:
+    kr = _kr()
+    if not kr:
+        return False
+    try:
+        from keyring.backends import fail  # type: ignore
+
+        return not isinstance(kr.get_keyring(), fail.Keyring)
+    except Exception:
+        return True  # injected fake or unknown backend: assume usable
+
+
+def secret_get(name: str) -> Optional[str]:
+    kr = _kr()
+    if not kr:
+        return None
+    try:
+        return kr.get_password(KEYRING_SERVICE, name) or None
+    except Exception:
+        return None
+
+
+def secret_set(name: str, value: str) -> bool:
+    kr = _kr()
+    if not kr:
+        return False
+    try:
+        if value:
+            kr.set_password(KEYRING_SERVICE, name, value)
+        else:
+            try:
+                kr.delete_password(KEYRING_SERVICE, name)
+            except Exception:
+                pass  # nothing stored
+        return True
+    except Exception:
+        return False
+
+
+def save_settings(s: Settings, path: Path = SETTINGS_PATH) -> List[str]:
+    """Write settings. Secret fields go to the OS keyring (when 'remember' is on) and are NEVER written
+    to the JSON file. Returns the names of secrets that could not be stored securely."""
     data = asdict(s)
-    if not s.remember:
-        secret = {f.key for f in all_fields() if f.secret}
-        data["creds"] = {k: ("" if k in secret else v) for k, v in s.creds.items()}
+    secret_keys = {f.key for f in all_fields() if f.secret}
+    data["creds"] = {k: ("" if k in secret_keys else v) for k, v in s.creds.items()}
+    for k in secret_keys:  # scrub legacy flat keys from older versions
+        data.pop(k, None)
+    failed: List[str] = []
+    for k in secret_keys:
+        val = s.creds.get(k, "") if s.remember else ""
+        if not secret_set(k, val) and val:
+            failed.append(k)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -111,3 +178,4 @@ def save_settings(s: Settings, path: Path = SETTINGS_PATH) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
+    return failed

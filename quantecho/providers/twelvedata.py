@@ -5,14 +5,17 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from ..models import Quote
 from ..ta import coerce_float
-from .base import NY, Field, Http, ProviderError, ProviderSpec, bar, latest_session, need, parse_local
+from .base import NY, Field, Http, ProviderError, ProviderSpec, bar, http_error, latest_session, need, parse_local
 
 BASE = "https://api.twelvedata.com"
 
 
 def _check(p: Any) -> Any:
     if isinstance(p, dict) and p.get("status") == "error":
-        raise ProviderError(f"Twelve Data {p.get('code', '')}: {p.get('message', 'error')}")
+        code = p.get("code")
+        if isinstance(code, int) and code in (401, 403, 429):
+            raise http_error(code, f"Twelve Data: {p.get('message', 'error')}", "60" if code == 429 else None)
+        raise ProviderError(f"Twelve Data {code or ''}: {p.get('message', 'error')}")
     return p
 
 

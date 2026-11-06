@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from ..models import Quote
 from ..ta import coerce_float
-from .base import NY, Field, Http, ProviderError, ProviderSpec, bar, latest_session, need, parse_local
+from .base import NY, Field, Http, ProviderError, ProviderSpec, RateLimited, bar, latest_session, need, parse_local
 
 BASE = "https://www.alphavantage.co/query"
 
@@ -14,9 +14,11 @@ BASE = "https://www.alphavantage.co/query"
 def _check(p: Any) -> Dict[str, Any]:
     if not isinstance(p, dict):
         raise ProviderError("Alpha Vantage: bad response")
-    for k in ("Error Message", "Note", "Information"):
+    if "Error Message" in p:
+        raise ProviderError(f"Alpha Vantage: {str(p['Error Message'])[:200]}")
+    for k in ("Note", "Information"):  # AV signals quota exhaustion with HTTP 200 + one of these
         if k in p:
-            raise ProviderError(f"Alpha Vantage: {str(p[k])[:200]}")
+            raise RateLimited(f"Alpha Vantage: {str(p[k])[:200]}", retry_after=60.0)
     return p
 
 

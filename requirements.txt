@@ -3,6 +3,7 @@ schwab-py>=1.5,<2
 httpx>=0.28
 python-dotenv>=1.0
 tzdata>=2024.1
+keyring>=25
 
 # Optional: legacy Polygon scripts in legacy/
 # polygon-api-client>=1.15

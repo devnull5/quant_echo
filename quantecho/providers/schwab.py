@@ -9,13 +9,14 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from ..models import Quote
 from ..ta import coerce_float
-from .base import Field, ProviderError, ProviderSpec, bar, latest_session, need
+from .base import Field, ProviderError, ProviderSpec, bar, http_error, latest_session, need
 
 
 def _json(resp: Any) -> Any:
     if hasattr(resp, "status_code") and hasattr(resp, "json"):
         if resp.status_code >= 400:
-            raise ProviderError(f"HTTP {resp.status_code}: {(resp.text or '')[:250]}")
+            headers = getattr(resp, "headers", None) or {}
+            raise http_error(resp.status_code, resp.text or "", headers.get("Retry-After"))
         return resp.json()
     return resp
 

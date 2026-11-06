@@ -49,6 +49,45 @@ class ProviderError(RuntimeError):
     pass
 
 
+class RateLimited(ProviderError):
+    """The source said 'slow down' (HTTP 429 or an in-body quota message)."""
+
+    def __init__(self, msg: str, retry_after: Optional[float] = None):
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
+class AuthError(ProviderError):
+    """Bad/expired credentials or plan doesn't include this endpoint (HTTP 401/403)."""
+
+
+def _retry_after(value: Optional[str]) -> Optional[float]:
+    try:
+        return max(0.0, float(value)) if value else None
+    except ValueError:
+        return None
+
+
+def _clean_body(body: str) -> str:
+    """Collapse HTML error pages to their <title>/<h1> and squash whitespace."""
+    b = (body or "").strip()
+    if b.startswith("<"):
+        m = re.search(r"<(?:title|h1)>(.*?)</(?:title|h1)>", b, re.I | re.S)
+        b = m.group(1) if m else re.sub(r"<[^>]+>", " ", b)
+    return re.sub(r"\s+", " ", b).strip()
+
+
+def http_error(status: int, body: str, retry_after: Optional[str] = None) -> ProviderError:
+    msg = f"HTTP {status}: {_clean_body(body)[:250]}"
+    if status in (401, 403):
+        msg += " — check the API key / plan in ⚙ Settings"
+    if status == 429:
+        return RateLimited(msg, _retry_after(retry_after))
+    if status in (401, 403):
+        return AuthError(msg)
+    return ProviderError(msg)
+
+
 # ---------------------------------------------------------------- HTTP
 
 class Http:
@@ -77,7 +116,8 @@ class Http:
         except httpx.HTTPError as e:
             raise ProviderError(self.redact(f"{type(e).__name__}: {e}")) from None
         if r.status_code >= 400:
-            raise ProviderError(self.redact(f"HTTP {r.status_code}: {r.text[:250]}"))
+            err = http_error(r.status_code, self.redact(r.text), r.headers.get("Retry-After"))
+            raise err
         try:
             return r.json()
         except ValueError:
@@ -91,9 +131,9 @@ def parse_iso(s: str) -> Optional[int]:
     if not isinstance(s, str) or not s:
         return None
     s = s.strip().replace("Z", "+00:00")
-    m = re.match(r"^(.*?\.\d{1,6})\d*(.*)$", s)  # trim >6 fractional digits
+    m = re.match(r"^(.*?)\.(\d+)(.*)$", s)  # normalise fraction to exactly 6 digits (py3.10 needs 3 or 6)
     if m:
-        s = m.group(1) + m.group(2)
+        s = f"{m.group(1)}.{m.group(2)[:6].ljust(6, '0')}{m.group(3)}"
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:

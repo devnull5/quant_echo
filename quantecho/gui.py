@@ -11,8 +11,9 @@ import webbrowser
 from tkinter import messagebox, ttk
 from typing import Dict, Optional
 
-from . import journal, llm
-from .config import Settings, load_settings, normalize_host, save_settings
+from . import journal, llm, logsetup
+from .logsetup import log as filelog
+from .config import Settings, keyring_available, load_settings, normalize_host, save_settings
 from .poller import Poller
 from .providers import PROVIDERS, all_fields, create
 from .telemetry import TelemetryStore
@@ -144,7 +145,8 @@ class App(tk.Tk):
         ttk.Button(ai_row, text="↻", width=3, command=self.refresh_models).pack(side="left", padx=4)
         ttk.Label(ai_row, textvariable=self.v_ai_status, style="Muted.TLabel").pack(side="left", padx=6)
         ttk.Button(ai_row, text="Save", command=self.on_save).pack(side="right", padx=10)
-        ttk.Checkbutton(ai_row, text="Remember keys", variable=self.v_remember).pack(side="right")
+        ttk.Checkbutton(ai_row, text="Remember keys (OS keychain)" if keyring_available()
+                        else "Remember keys (unavailable — use .env)", variable=self.v_remember).pack(side="right")
 
         # --- body
         body = ttk.PanedWindow(self, orient="horizontal")
@@ -191,7 +193,8 @@ class App(tk.Tk):
                         command=self._schedule_auto).pack(side="left", padx=(10, 4))
         ttk.Entry(auto, textvariable=self.v_auto_min, width=4).pack(side="left")
         ttk.Label(auto, text="min (while running)", style="Muted.TLabel").pack(side="left", padx=4)
-        ttk.Button(auto, text="📓 Journal", command=self.open_journal).pack(side="right", padx=10)
+        ttk.Button(auto, text="📄 Log", command=self.open_log).pack(side="right", padx=(0, 10))
+        ttk.Button(auto, text="📓 Journal", command=self.open_journal).pack(side="right", padx=4)
         q_entry = ttk.Entry(qa, textvariable=self.v_question)
         q_entry.pack(side="left", fill="x", expand=True, padx=(10, 6))
         q_entry.bind("<Return>", lambda _e: self.on_ask())
@@ -349,10 +352,16 @@ class App(tk.Tk):
     def on_save(self) -> None:
         self.settings = self._collect()
         try:
-            save_settings(self.settings)
-            self.log(f"[{self._ts()}] Settings saved.")
+            failed = save_settings(self.settings)
         except OSError as e:
             messagebox.showerror("Save failed", str(e))
+            return
+        if failed:
+            self.log(f"[{self._ts()}] Settings saved, but no secure keychain is available, so these keys were "
+                     f"NOT stored: {', '.join(failed)}. Put them in .env instead.", "warn")
+        else:
+            where = "OS keychain" if self.settings.remember else "not stored (Remember keys is off)"
+            self.log(f"[{self._ts()}] Settings saved. Keys: {where}.")
 
     def on_start(self) -> None:
         if self.poller and self.poller.is_alive():
@@ -362,6 +371,7 @@ class App(tk.Tk):
         try:
             provider = create(s.provider, s.creds)
         except Exception as e:
+            filelog.warning(f"Provider {s.provider} failed to start: {e}")
             self._toggle_settings(True)
             messagebox.showerror(spec.label, str(e))
             return
@@ -375,6 +385,7 @@ class App(tk.Tk):
         self.poller = Poller(provider, s.symbols.replace(",", " ").split(), s.focus, interval,
                              self.events, self.telemetry, bars_every=max(spec.min_bars_every, interval))
         self.poller.start()
+        filelog.info(f"Start provider={s.provider} focus={s.focus} symbols={s.symbols!r} interval={interval}s")
         self.v_status.set(f"Live · {spec.label} · {s.focus}")
 
     def on_stop(self) -> None:
@@ -439,6 +450,10 @@ class App(tk.Tk):
             if first[0]:  # nothing streamed -> error/empty message
                 self.events.put(("ai_tok", " " + text))
             speed = f", {st.tok_per_s:.0f} tok/s" if st.tok_per_s else ""
+            if text.startswith("[Ollama"):
+                filelog.warning(f"AI failed ({s.model}): {text}")
+            else:
+                filelog.info(f"AI ok {title!r} model={s.model} {time.monotonic() - t0:.0f}s {st.tok_per_s:.0f} tok/s")
             note = ""
             if not text.startswith("[Ollama"):
                 try:
@@ -541,10 +556,30 @@ class App(tk.Tk):
         except (AttributeError, OSError):
             webbrowser.open(path.as_uri())
 
+    def report_callback_exception(self, exc, val, tb) -> None:  # Tk hook
+        filelog.error("UI callback error", exc_info=(exc, val, tb))
+        try:
+            self.log(f"[{self._ts()}] Internal error: {exc.__name__}: {val} (details in log file)", "warn")
+        except tk.TclError:
+            pass
+
+    def open_log(self) -> None:
+        path = logsetup.LOG_PATH
+        if not path.exists():
+            self.log(f"[Log] No log yet at {path}")
+            return
+        try:
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        except (AttributeError, OSError):
+            webbrowser.open(path.as_uri())
+
     def _on_close(self) -> None:
         self.on_stop()
         self.destroy()
 
 
 def main() -> None:
+    path = logsetup.setup()
+    filelog.info(f"QuantEcho starting (log: {path})")
     App().mainloop()
+    filelog.info("QuantEcho closed")

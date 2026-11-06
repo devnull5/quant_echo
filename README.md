@@ -1,5 +1,6 @@
 # QuantEcho
 
+[![CI](https://github.com/devnull5/quant_echo/actions/workflows/ci.yml/badge.svg)](https://github.com/devnull5/quant_echo/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 
@@ -17,19 +18,24 @@ leaves your machine except market-data requests. **Read-only:** it never places 
 
 Pick one from the **Source** dropdown. Keys go in **⚙ Settings** or `.env`.
 
-| Source | Key? | Quotes | 1-min bars / TA | Free-tier notes |
-|---|---|---|---|---|
-| Yahoo Finance | none | ✓ | ✓ | Unofficial endpoint; default |
-| Charles Schwab | app key + secret | ✓ real-time, bid/ask | ✓ | Run `python -m quantecho.auth`; token lasts 7 days |
-| Alpaca | key id + secret | ✓ bid/ask | ✓ | Free = IEX feed; `sip` needs paid plan |
-| Tiingo (IEX) | token | ✓ bid/ask | ✓ | ~50 req/hr free → polls every 60s |
-| Finnhub | key | ✓ | paid only | 60 req/min |
-| Polygon.io / Massive | key | paid (free = prev close) | ✓ (delayed on free) | 5 req/min free |
-| Twelve Data | key | ✓ | ✓ | 8 credits/min (1 per symbol) |
-| Alpha Vantage | key | ✓ | ✓ | 25 requests/**day** free |
-| Simulated | none | fake | fake | Offline demo / UI testing |
+| Source | Key? | Quotes | 1-min bars / TA | Free-tier notes | Verified live |
+|---|---|---|---|---|---|
+| Yahoo Finance | none | ✓ | ✓ | Unofficial endpoint; default | ✓ quotes + bars |
+| Charles Schwab | app key + secret | ✓ real-time, bid/ask | ✓ | Run `python -m quantecho.auth`; token lasts 7 days | parser vs. API docs |
+| Alpaca | key id + secret | ✓ bid/ask | ✓ | Free = IEX feed; `sip` needs paid plan | endpoint + auth errors |
+| Tiingo (IEX) | token | ✓ bid/ask | ✓ | ~50 req/hr free → polls every 60s | endpoint + auth errors |
+| Finnhub | key | ✓ | paid only | 60 req/min | endpoint + auth errors |
+| Polygon.io / Massive | key | paid (free = prev close) | ✓ (delayed on free) | 5 req/min free | endpoint + auth errors |
+| Twelve Data | key | ✓ | ✓ | 8 credits/min (1 per symbol) | ✓ quotes + bars (demo key) |
+| Alpha Vantage | key | ✓ | ✓ | 25 requests/**day** free | ✓ quote + bar format (demo key) |
+| Simulated | none | fake | fake | Offline demo / UI testing | n/a |
 
-The app automatically slows polling to each source's free-tier limit.
+"Endpoint + auth errors" means the real API was hit and its error responses are handled, but no
+real data has been parsed yet. If you use one of those, please open an issue with what you see.
+
+**Reliability.** Polling is throttled to each source's free-tier limit. On errors it backs off
+exponentially (up to 10 min), honours `Retry-After` on HTTP 429, backs off fully on bad keys
+(401/403), logs a failure once rather than every cycle, and reports when it recovers.
 
 ## Setup
 
@@ -90,7 +96,10 @@ python -m quantecho
 - Double-click a watchlist row to switch the focus symbol.
 - **Ask** sends your question (plus focus telemetry if ticked); **Analyze focus** asks for a
   structured bias / signals / levels / risk read.
-- Keys are saved to `~/.quanteco_gpt/settings.json` only when "Remember keys" is ticked.
+- **Keys** with "Remember keys" ticked go to your OS keychain (Windows Credential Manager, macOS
+  Keychain, Linux Secret Service), never to the settings file. If no keychain exists, use `.env`.
+- **📄 Log** opens `~/.quanteco_gpt/logs/quantecho.log` (rotating, 5 x 1 MB, keys redacted):
+  provider starts, errors, backoffs, AI timings and any crash tracebacks.
 
 ## Layout
 

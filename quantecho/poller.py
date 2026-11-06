@@ -7,6 +7,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
+from .logsetup import log as filelog
+from .providers.base import AuthError, RateLimited
 from .signals import SignalTracker
 from .telemetry import TelemetryStore
 
@@ -37,19 +39,49 @@ class Poller(threading.Thread):
         self._last_printed: Optional[float] = None
         self._next_bars = 0.0
         self.signals = SignalTracker(self.focus)
+        self.max_backoff = 600.0
+        self._streak = 0               # consecutive failed quote polls
+        self._last_err: Optional[str] = None
+        self._next_wait: float = float(self.interval)
 
     def stop(self) -> None:
         self._stop_evt.set()
 
-    def log(self, msg: str) -> None:
+    def log(self, msg: str, level: str = "info") -> None:
+        getattr(filelog, level)(msg)
         self.events.put(("log", f"[{time.strftime('%H:%M:%S')}] {msg}"))
 
+    def _backoff(self, e: Exception, what: str) -> float:
+        """Exponential backoff (honours Retry-After). Logs on first failure / when the error changes,
+        not every cycle, so a dead connection doesn't flood the log."""
+        self._streak += 1
+        if isinstance(e, AuthError):
+            wait = self.max_backoff  # credentials won't fix themselves
+        elif isinstance(e, RateLimited) and e.retry_after:
+            wait = min(max(e.retry_after, self.interval), self.max_backoff)
+        else:
+            wait = min(self.interval * (2 ** min(self._streak, 10)), self.max_backoff)
+        sig = f"{type(e).__name__}: {e}"
+        if sig != self._last_err or self._streak in (1, 5, 20):
+            kind = "Rate limited" if isinstance(e, RateLimited) else "Auth error" if isinstance(e, AuthError) else f"{what} error"
+            self.log(f"{kind} ({sig}) — retrying in {wait:.0f}s (attempt {self._streak})", "warning")
+            self._last_err = sig
+        return wait
+
+    def _recovered(self) -> None:
+        if self._streak:
+            self.log(f"Recovered after {self._streak} failed attempt(s)")
+        self._streak, self._last_err = 0, None
+
     def poll_once(self) -> None:
+        self._next_wait = float(self.interval)
         try:
             quotes = self.provider.get_quotes(self.symbols)
         except Exception as e:  # network/auth errors must not kill the thread
-            self.log(f"Quotes error: {type(e).__name__}: {e}")
+            self._next_wait = self._backoff(e, "Quotes")
             quotes = {}
+        else:
+            self._recovered()
         if quotes:
             self.telemetry.update_quotes(quotes)
             self.events.put(("quotes", None))
@@ -61,7 +93,7 @@ class Poller(threading.Thread):
                     self.log(f"{self.focus} {fq.last:.2f}{chg}")
                     self._last_printed = fq.last
 
-        if time.monotonic() >= self._next_bars:
+        if time.monotonic() >= self._next_bars and not self._streak:
             self._refresh_bars()
         self._check_signals()
 
@@ -81,8 +113,11 @@ class Poller(threading.Thread):
     def _refresh_bars(self) -> None:
         try:
             bars = self.provider.get_session_minute_bars(self.focus)
+        except RateLimited as e:
+            self.log(f"Bars rate limited ({e}) — will retry later", "warning")
+            bars = []
         except Exception as e:
-            self.log(f"Bars error: {type(e).__name__}: {e}")
+            self.log(f"Bars error: {type(e).__name__}: {e}", "warning")
             bars = []
         if bars:
             self.telemetry.update_bars(self.focus, bars)
@@ -99,6 +134,11 @@ class Poller(threading.Thread):
     def run(self) -> None:
         self.log(f"Polling started — focus={self.focus} symbols={self.symbols} every {self.interval}s")
         while not self._stop_evt.is_set():
-            self.poll_once()
-            self._stop_evt.wait(self.interval)
+            try:
+                self.poll_once()
+            except Exception:  # never let the polling thread die silently
+                filelog.exception("Unexpected error in poll loop")
+                self.log("Unexpected error in poll loop (details in log file)", "error")
+                self._next_wait = min(self.interval * 4, self.max_backoff)
+            self._stop_evt.wait(self._next_wait)
         self.log("Polling stopped")

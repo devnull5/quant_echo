@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]  # PEP 639 license string
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "quantecho"
-version = "0.3.0"
+version = "0.4.0"
 description = "Desktop market-data dashboard with intraday TA and local-LLM (Ollama) analysis. Read-only; never trades."
 readme = "README.md"
 license = "MIT"
@@ -14,6 +14,7 @@ dependencies = [
     "httpx>=0.28",
     "python-dotenv>=1.0",
     "tzdata>=2024.1",
+    "keyring>=25",
 ]
 keywords = ["trading", "market-data", "technical-analysis", "ollama", "llm", "tkinter", "schwab", "yahoo-finance"]
 classifiers = [

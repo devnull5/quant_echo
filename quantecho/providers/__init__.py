@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Dict, List, Mapping
 
 from . import alpaca, alphavantage, finnhub, polygon, schwab, simulated, tiingo, twelvedata, yahoo
-from .base import Field, Provider, ProviderError, ProviderSpec
+from .base import AuthError, Field, Provider, ProviderError, ProviderSpec, RateLimited
 
 PROVIDERS: Dict[str, ProviderSpec] = {
     s.id: s
@@ -34,5 +34,5 @@ def create(provider_id: str, creds: Mapping[str, str]) -> Provider:
     return spec.factory(creds)
 
 
-__all__ = ["PROVIDERS", "DEFAULT_PROVIDER", "Field", "Provider", "ProviderError", "ProviderSpec", "all_fields",
+__all__ = ["PROVIDERS", "DEFAULT_PROVIDER", "AuthError", "RateLimited", "Field", "Provider", "ProviderError", "ProviderSpec", "all_fields",
            "create"]

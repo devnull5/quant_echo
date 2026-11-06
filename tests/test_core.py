@@ -6,7 +6,27 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
+import quantecho.config as _cfg
 from quantecho import llm
+
+
+class FakeKeyring:
+    """In-memory stand-in so tests never touch the real OS credential store."""
+
+    def __init__(self):
+        self.store = {}
+
+    def get_password(self, svc, name):
+        return self.store.get((svc, name))
+
+    def set_password(self, svc, name, value):
+        self.store[(svc, name)] = value
+
+    def delete_password(self, svc, name):
+        self.store.pop((svc, name), None)
+
+
+_cfg._keyring = FakeKeyring()
 from quantecho.config import Settings, load_settings, normalize_host, save_settings
 from quantecho.poller import Poller
 from quantecho.providers import PROVIDERS, ProviderError, create
@@ -231,7 +251,8 @@ class TestProviders(unittest.TestCase):
         self.assertEqual((q.last, q.net_pct), (250.10, 0.4418))
         self.assertEqual(p.get_session_minute_bars("IBM")[0]["t"], T0)
         limited = AlphaVantageProvider("k", http=FakeHttp({"GLOBAL_QUOTE": {"Information": "rate limit 25/day"}}))
-        with self.assertRaises(ProviderError):
+        from quantecho.providers import RateLimited
+        with self.assertRaises(RateLimited):
             limited.get_quotes(["IBM"])
 
     def test_simulated_end_to_end(self):
@@ -260,6 +281,14 @@ class TestProviders(unittest.TestCase):
         self.assertEqual(parse_iso("2026-11-05T14:30:00.123456789Z"), a + 123)
         self.assertEqual(parse_iso("2026-11-05T09:30:00-05:00"), a)
         self.assertIsNone(parse_iso("garbage"))
+        self.assertEqual(parse_iso("2026-11-05T14:30:00.1Z"), a + 100)       # short fractions (py3.10-safe)
+        self.assertEqual(parse_iso("2026-11-05T14:30:00.1234Z"), a + 123)
+
+    def test_html_error_bodies_cleaned(self):
+        from quantecho.providers.base import http_error
+        e = http_error(401, "<html><head><title>401 Authorization Required</title></head><body>x</body></html>")
+        self.assertIn("401 Authorization Required", str(e))
+        self.assertNotIn("<", str(e))
 
 
 # ============================================================ TA
@@ -311,7 +340,48 @@ class TestPoller(unittest.TestCase):
         Poller(Boom(), ["SPY"], "SPY", 5, ev, TelemetryStore()).poll_once()
         logs = " ".join(ev.get_nowait()[1] for _ in range(ev.qsize()))
         self.assertIn("Quotes error", logs)
-        self.assertIn("Bars error", logs)
+        self.assertNotIn("Bars", logs)  # don't hammer a second endpoint while the source is failing
+
+    def test_backoff_and_recovery(self):
+        from quantecho.providers import AuthError, RateLimited
+
+        class Flaky:
+            def __init__(self):
+                self.errors = [ConnectionError("down")] * 3 + [RateLimited("429", retry_after=42)] +                               [AuthError("HTTP 401: bad key")]
+                self.ok = False
+
+            def get_quotes(self, s):
+                if self.errors and not self.ok:
+                    raise self.errors.pop(0)
+                return parse_quotes(QUOTES)
+
+            def get_session_minute_bars(self, s):
+                return []
+
+        ev, prov = queue.Queue(), Flaky()
+        p = Poller(prov, ["SPY"], "SPY", 5, ev, TelemetryStore())
+        waits = []
+        for _ in range(5):
+            p.poll_once()
+            waits.append(p._next_wait)
+        self.assertEqual(waits[:3], [10, 20, 40])        # exponential
+        self.assertEqual(waits[3], 42)                    # Retry-After honoured
+        self.assertEqual(waits[4], p.max_backoff)         # auth errors back off fully
+        logs = [ev.get_nowait()[1] for _ in range(ev.qsize())]
+        self.assertEqual(sum("ConnectionError" in m for m in logs), 1)  # not logged every cycle
+        prov.ok = True
+        p.poll_once()
+        self.assertEqual(p._next_wait, 5)
+        self.assertTrue(any("Recovered after 5" in ev.get_nowait()[1] for _ in range(ev.qsize())))
+
+    def test_http_error_mapping(self):
+        from quantecho.providers.base import AuthError, RateLimited, http_error
+        e = http_error(429, "slow down", "30")
+        self.assertIsInstance(e, RateLimited)
+        self.assertEqual(e.retry_after, 30.0)
+        self.assertIsInstance(http_error(403, "nope"), AuthError)
+        self.assertIn("HTTP 403", str(http_error(403, "nope")))  # polygon fallback relies on this text
+        self.assertNotIsInstance(http_error(500, "x"), (RateLimited, AuthError))
 
 
 # ============================================================ Ollama
@@ -340,6 +410,46 @@ class TestLLM(unittest.TestCase):
 # ============================================================ config
 
 class TestConfig(unittest.TestCase):
+    def test_secrets_go_to_keyring_never_file(self):
+        kr = _cfg._keyring = FakeKeyring()
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.json"
+            failed = save_settings(Settings(provider="alpaca", remember=True,
+                                            creds={"alpaca_key_id": "AKX", "alpaca_secret": "SSS", "alpaca_feed": "sip"}),
+                                   path)
+            self.assertEqual(failed, [])
+            text = path.read_text()
+            self.assertNotIn("AKX", text)
+            self.assertNotIn("SSS", text)
+            self.assertEqual(kr.store[("quantecho", "alpaca_key_id")], "AKX")
+            loaded = load_settings(path)
+            self.assertEqual((loaded.creds["alpaca_key_id"], loaded.creds["alpaca_feed"]), ("AKX", "sip"))
+            # turning Remember off wipes them from the keyring
+            save_settings(Settings(remember=False, creds={"alpaca_key_id": "AKX"}), path)
+            self.assertNotIn(("quantecho", "alpaca_key_id"), kr.store)
+
+    def test_no_keyring_reports_unsaved(self):
+        _cfg._keyring = False
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "s.json"
+                failed = save_settings(Settings(remember=True, creds={"finnhub_token": "TOK"}), path)
+                self.assertEqual(failed, ["finnhub_token"])
+                self.assertNotIn("TOK", path.read_text())
+        finally:
+            _cfg._keyring = FakeKeyring()
+
+    def test_legacy_plaintext_secret_scrubbed_on_save(self):
+        _cfg._keyring = FakeKeyring()
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.json"
+            path.write_text(json.dumps({"schwab_app_key": "OLDKEY", "creds": {"finnhub_token": "OLDTOK"}}))
+            s = load_settings(path)
+            self.assertEqual(s.creds["finnhub_token"], "OLDTOK")
+            save_settings(s, path)
+            self.assertNotIn("OLD", path.read_text())
+            self.assertEqual(_cfg._keyring.store[("quantecho", "schwab_app_key")], "OLDKEY")
+
     def test_secrets_not_saved_without_remember(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "s.json"
