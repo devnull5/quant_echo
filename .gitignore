@@ -17,3 +17,8 @@ venv/
 # IDE
 .idea/
 .vscode/
+
+# Packaging
+build/
+dist/
+*.egg-info/
