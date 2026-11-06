@@ -164,7 +164,9 @@ class App(tk.Tk):
 
         left = ttk.Frame(body)
         cols = ("last", "bid", "ask", "pct", "vol")
-        self.tree = ttk.Treeview(left, columns=cols, show="tree headings", height=12)
+        tree_box = ttk.Frame(left)
+        tree_box.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(tree_box, columns=cols, show="tree headings", height=12)
         self.tree.heading("#0", text="Symbol")
         self.tree.column("#0", width=80)
         for c, label, w in zip(cols, ("Last", "Bid", "Ask", "Day %", "Volume"), (80, 75, 75, 70, 100), strict=True):
@@ -174,12 +176,10 @@ class App(tk.Tk):
         self.tree.tag_configure("down", foreground=C["down"])
         self.tree.tag_configure("focus", background="#18212d")
         self.tree.bind("<Double-1>", self._on_tree_dbl)
-        tree_box = ttk.Frame(left)
-        tree_box.pack(fill="both", expand=True)
         sb = ttk.Scrollbar(tree_box, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
-        self.tree.pack(in_=tree_box, side="left", fill="both", expand=True)
+        self.tree.pack(side="left", fill="both", expand=True)
         ttk.Label(left, text="Double-click a row to make it the focus", style="Muted.TLabel").pack(anchor="w", pady=4)
         body.add(left, weight=2)
 
