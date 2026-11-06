@@ -62,5 +62,4 @@ SPEC = ProviderSpec(
     notes="Fake random-walk prices for trying the app with no keys or internet. Not real data!",
     min_interval=1,
     min_bars_every=30,
-    default_symbols="SPY QQQ NVDA AAPL TSLA",
 )

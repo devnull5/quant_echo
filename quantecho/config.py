@@ -20,6 +20,7 @@ except ImportError:  # optional
     pass
 
 from .llm import DEFAULT_HOST, DEFAULT_MODEL
+from .watchlists import DEFAULT_EQUITY
 from .providers import DEFAULT_PROVIDER, PROVIDERS, all_fields
 
 SETTINGS_PATH = Path.home() / ".quanteco_gpt" / "settings.json"
@@ -28,7 +29,7 @@ SETTINGS_PATH = Path.home() / ".quanteco_gpt" / "settings.json"
 @dataclass
 class Settings:
     provider: str = DEFAULT_PROVIDER
-    symbols: str = "SPY QQQ NVDA"
+    symbols: str = DEFAULT_EQUITY
     focus: str = "SPY"
     interval: int = 20
     model: str = DEFAULT_MODEL

@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Seque
 from zoneinfo import ZoneInfo
 
 from ..models import Quote
+from ..watchlists import DEFAULT_EQUITY
 
 NY = ZoneInfo("America/New_York")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) QuantEcho/1.0"
@@ -45,7 +46,16 @@ class ProviderSpec:
     signup_url: str = ""
     market: str = "equity"        # "equity" (US session hours) or "crypto" (24/7, UTC day)
     personal_use_only: bool = False  # unofficial / terms forbid redistribution -> hidden unless opted in
-    default_symbols: str = "SPY QQQ NVDA"
+    default_symbols: str = DEFAULT_EQUITY
+    calls_per_symbol: float = 0.0    # requests per symbol per poll (0 = batched, cost independent of size)
+    max_calls_per_min: float = 0.0   # free-tier budget for those requests (0 = no per-symbol limit)
+
+    def interval_for(self, n_symbols: int, requested: int) -> int:
+        """Seconds between polls that keep `n_symbols` inside the free-tier budget."""
+        need = 0.0
+        if self.calls_per_symbol and self.max_calls_per_min:
+            need = n_symbols * self.calls_per_symbol * 60.0 / self.max_calls_per_min
+        return int(max(requested, self.min_interval, -(-need // 1)))
     clip_volume_spikes: bool = False  # cap absurd single-bar volume (for feeds known to glitch)
 
 

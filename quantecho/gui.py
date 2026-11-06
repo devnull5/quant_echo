@@ -174,7 +174,12 @@ class App(tk.Tk):
         self.tree.tag_configure("down", foreground=C["down"])
         self.tree.tag_configure("focus", background="#18212d")
         self.tree.bind("<Double-1>", self._on_tree_dbl)
-        self.tree.pack(fill="both", expand=True)
+        tree_box = ttk.Frame(left)
+        tree_box.pack(fill="both", expand=True)
+        sb = ttk.Scrollbar(tree_box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tree.pack(in_=tree_box, side="left", fill="both", expand=True)
         ttk.Label(left, text="Double-click a row to make it the focus", style="Muted.TLabel").pack(anchor="w", pady=4)
         body.add(left, weight=2)
 
@@ -397,9 +402,11 @@ class App(tk.Tk):
             self._toggle_settings(True)
             messagebox.showerror(spec.label, str(e))
             return
-        interval = max(s.interval, spec.min_interval)
+        n_syms = len(dict.fromkeys(s.symbols.replace(",", " ").split())) or 1
+        interval = spec.interval_for(n_syms, s.interval)
         if interval != s.interval:
-            self.log(f"[{self._ts()}] {spec.label}: free-tier limits → polling every {interval}s "
+            why = f"{n_syms} symbols on the free tier" if spec.calls_per_symbol else "free-tier limits"
+            self.log(f"[{self._ts()}] {spec.label}: {why} → polling every {interval}s "
                      f"instead of {s.interval}s.", "warn")
         for iid in self.tree.get_children():
             self.tree.delete(iid)

@@ -73,6 +73,7 @@ SPEC = ProviderSpec(
     fields=(Field("twelvedata_key", "API Key", "TWELVEDATA_API_KEY"),),
     notes="Free key: 8 credits/min (1 per symbol). Keep the watchlist small or poll every 60s+.",
     min_interval=60,
+    calls_per_symbol=1, max_calls_per_min=8,   # 1 credit per symbol, 8 credits/min free
     min_bars_every=180,
     signup_url="https://twelvedata.com",
 )

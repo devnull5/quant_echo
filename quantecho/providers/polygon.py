@@ -88,6 +88,7 @@ SPEC = ProviderSpec(
     fields=(Field("polygon_api_key", "API Key", "POLYGON_API_KEY"),),
     notes="Live snapshots need a paid plan. Free key = 5 req/min, previous-close quotes + delayed minute bars.",
     min_interval=15,
+    calls_per_symbol=1, max_calls_per_min=5,   # free tier falls back to 1 call/symbol at 5/min
     min_bars_every=120,
     signup_url="https://polygon.io",
 )

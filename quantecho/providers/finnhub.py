@@ -74,6 +74,7 @@ SPEC = ProviderSpec(
     fields=(Field("finnhub_token", "API Key", "FINNHUB_API_KEY"),),
     notes="Free key: real-time quotes (60/min). Minute candles need a paid plan, so TA stays empty on free.",
     min_interval=5,
+    calls_per_symbol=1, max_calls_per_min=50,  # 60/min free; keep headroom
     min_bars_every=300,
     signup_url="https://finnhub.io",
 )

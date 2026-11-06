@@ -43,11 +43,17 @@ class TiingoProvider:
         self.http = http or Http(BASE, headers={"Authorization": f"Token {token}"}, secrets=(token,))
 
     def get_quotes(self, symbols: List[str]) -> Dict[str, Quote]:
-        return parse_iex(self.http.get("iex/", {"tickers": ",".join(s.lower() for s in symbols)}))
+        tmap = {s.upper().replace(".", "-"): s.upper() for s in symbols}   # BRK.B -> BRK-B (Tiingo spelling)
+        raw = parse_iex(self.http.get("iex/", {"tickers": ",".join(t.lower() for t in tmap)}))
+        out: Dict[str, Quote] = {}
+        for t, q in raw.items():
+            q.symbol = tmap.get(t, t)
+            out[q.symbol] = q
+        return out
 
     def get_session_minute_bars(self, symbol: str) -> List[Dict[str, Any]]:
         start = (datetime.now(NY).date() - timedelta(days=5)).isoformat()
-        p = self.http.get(f"iex/{symbol.lower()}/prices", {
+        p = self.http.get(f"iex/{symbol.lower().replace('.', '-')}/prices", {
             "startDate": start, "resampleFreq": "1min", "afterHours": "true",
             "columns": "open,high,low,close,volume",
         })

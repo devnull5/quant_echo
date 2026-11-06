@@ -84,6 +84,7 @@ SPEC = ProviderSpec(
     fields=(Field("alphavantage_key", "API Key", "ALPHAVANTAGE_API_KEY"),),
     notes="Free key = 25 requests/day total. Use 1 symbol and a long interval, or a premium key.",
     min_interval=600,
+    calls_per_symbol=1, max_calls_per_min=25 / 1440,  # 25 requests per DAY
     min_bars_every=1800,
     signup_url="https://www.alphavantage.co",
 )

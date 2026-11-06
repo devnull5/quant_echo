@@ -16,7 +16,12 @@ leaves your machine except market-data requests. **Read-only:** it never places 
 
 ## Data sources
 
-On first launch a picker offers three zero-hassle starts: **Crypto** (Coinbase, live, no signup),
+The default stock watchlist is **SPY plus its top 20 holdings** (AAPL, NVDA, MSFT, AMZN, GOOGL, AVGO,
+META, GOOG, LLY, TSLA, BRK.B, JPM, MU, AMD, V, XOM, JNJ, WMT, MA, ABBV; weights as of 2026-11-04,
+see `quantecho/watchlists.py`). Sources that charge per symbol automatically poll more slowly so a
+21-symbol list stays inside their free tier.
+
+On launch a picker offers three zero-hassle starts: **Crypto** (Coinbase, live, no signup),
 **US stocks** (free Alpaca key, ~2 min) or **Demo**. Change source any time from the **Source**
 dropdown; keys go in **⚙ Settings** (saved to your OS keychain) or `.env`.
 

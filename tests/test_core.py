@@ -154,17 +154,58 @@ class TestProviders(unittest.TestCase):
             "indicators": {"quote": [{"open": [1, 2, 3], "high": [1, 2, 3], "low": [1, 2, 3],
                                       "close": [1.5, None, 3.5], "volume": [10, 20, 30]}]},
         }]}}
-        p = YahooProvider(http=FakeHttp({"SPY": chart}))
+        spark = {"SPY": {"symbol": "SPY", "fulldayPrice": 740.65, "previousClose": 733.0,
+                         "fulldayChangePercent": 1.044, "timestamp": [1793978700, 1793978820],
+                         "close": [740.1, 740.65]}}
+        p = YahooProvider(http=FakeHttp({"spark": spark, "chart/SPY": chart}))
         q = p.get_quotes(["spy"])["SPY"]
-        self.assertEqual((q.last, q.net_pct, q.timestamp_ms), (740.65, 1.044, 1793978820000))
+        self.assertEqual((q.last, q.net_pct, q.timestamp_ms, q.total_volume), (740.65, 1.044, 1793978820000, 14234102))
         bars = p.get_session_minute_bars("SPY")
         self.assertEqual([b["close"] for b in bars], [1.5, 3.5])  # None close dropped
 
+    def test_yahoo_batches_and_class_shares(self):
+        from quantecho.providers.yahoo import YahooProvider, to_yahoo
+        from quantecho.watchlists import DEFAULT_EQUITY
+        syms = DEFAULT_EQUITY.split()
+        self.assertEqual(len(syms), 21)
+        self.assertEqual(to_yahoo("BRK.B"), "BRK-B")
+
+        class SparkHttp:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, path, params=None, headers=None):
+                self.calls.append((path, params))
+                if path == "spark":
+                    asked = params["symbols"].split(",")
+                    assert len(asked) <= 20, "Yahoo rejects >20 symbols per spark call"
+                    return {y: {"symbol": y, "fulldayPrice": 100.0, "previousClose": 99.0, "timestamp": [1],
+                                "close": [100.0]} for y in asked}
+                y = path.split("/", 1)[1]
+                return {"chart": {"result": [{"meta": {"symbol": y, "regularMarketPrice": 100.0,
+                                                        "regularMarketVolume": 5000}}]}}
+
+        http = SparkHttp()
+        p = YahooProvider(http=http)
+        q = p.get_quotes(syms)
+        self.assertEqual(len(q), 21)
+        self.assertIn("BRK.B", q)                                    # keyed by the user's spelling
+        self.assertEqual(sum(c[0] == "spark" for c in http.calls), 2)  # 21 symbols -> 2 batch calls
+        self.assertEqual(sum(c[0].startswith("chart/") for c in http.calls), 4)  # + 4 volume fills (first polls)
+        for _ in range(12):
+            q = p.get_quotes(syms)
+        self.assertTrue(all(v.total_volume == 5000 for v in q.values()))  # rotation fills all volumes
+
+    def test_interval_scales_with_watchlist(self):
+        self.assertEqual(PROVIDERS["yahoo"].interval_for(21, 20), 20)       # batched
+        self.assertEqual(PROVIDERS["finnhub"].interval_for(21, 20), 26)     # 21 calls at 50/min
+        self.assertEqual(PROVIDERS["twelvedata"].interval_for(3, 60), 60)
+        self.assertEqual(PROVIDERS["twelvedata"].interval_for(21, 60), 158)
+
     def test_yahoo_error(self):
         from quantecho.providers.yahoo import YahooProvider
-        bad = {"chart": {"result": None, "error": {"code": "Not Found", "description": "No data found"}}}
-        with self.assertRaises(ProviderError):
-            YahooProvider(http=FakeHttp({"ZZZZ": bad})).get_quotes(["ZZZZ"])
+        with self.assertRaises(ProviderError):  # spark omits unknown symbols -> nothing returned
+            YahooProvider(http=FakeHttp({"spark": {}})).get_quotes(["ZZZZ"])
 
     def test_alpaca(self):
         from quantecho.providers.alpaca import AlpacaProvider

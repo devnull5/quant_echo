@@ -146,7 +146,9 @@ class Poller(threading.Thread):
             filelog.debug(msg)
 
     def run(self) -> None:
-        self.log(f"Polling started — focus={self.focus} symbols={self.symbols} every {self.interval}s")
+        n = len(self.symbols)
+        listing = " ".join(self.symbols) if n <= 6 else f"{n} symbols"
+        self.log(f"Polling started — focus {self.focus}, {listing}, every {self.interval}s")
         while not self._stop_evt.is_set():
             try:
                 self.poll_once()

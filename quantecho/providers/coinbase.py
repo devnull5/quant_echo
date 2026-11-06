@@ -106,6 +106,7 @@ SPEC = ProviderSpec(
     notes="Free, official, real-time crypto prices — no signup. Symbols like BTC-USD, ETH-USD, SOL-USD "
           "(or just BTC). Trades 24/7; 'day' = UTC day, change % = 24h.",
     min_interval=5,
+    calls_per_symbol=2, max_calls_per_min=300,  # ticker+stats per symbol; public limit ~10/s
     min_bars_every=60,
     signup_url="https://docs.cdp.coinbase.com/exchange/introduction/welcome",
     market="crypto",
