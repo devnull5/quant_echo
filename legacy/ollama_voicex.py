@@ -30,7 +30,7 @@ from requests.exceptions import ConnectionError as ReqConnectionError, RequestEx
 API_KEY = "BNsxRXtiqGbb06N7eAWUYGHrFDwetM7eyCu149U4QoixBNA4"  # exact client id from portal
 APP_SECRET = "Teopc9FVQ7EVZ36puE3izYW6Uy1FBLc8Px0GmKc7ZCl9cvv332qTbpdbFO6k3uCf"  # app secret
 CALLBACK_URL = "https://127.0.0.1:8182"  # must match portal exactly (no trailing slash is fine)
-TOKEN_PATH = r"C:\Users\Filip\Projects\schwab_bot\tokens.json"
+TOKEN_PATH = "tokens.json"
 # =====================================================
 
 # When any of these are passed as the model name, Ollama is treated as disabled

@@ -1,8 +1,17 @@
 # QuantEcho
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+
 Desktop dashboard (Tk) that polls market data for a watchlist from **the data source you choose**,
-computes intraday TA on a focus symbol (VWAP, RSI-14, MACD 12/26/9), and asks a **local AI model
-(Ollama)** for a read on it. **Read-only:** it never places orders.
+computes intraday TA on a focus symbol (VWAP, EMA9/20, RSI-14, MACD 12/26/9), flags signals, and
+asks a **local AI model (Ollama)** for a read on it, so no cloud AI account is needed and nothing
+leaves your machine except market-data requests. **Read-only:** it never places orders.
+
+> **Disclaimer.** QuantEcho is an educational/research tool, **not financial advice**. AI output can
+> be wrong, and market data may be delayed, incomplete or glitchy. You are solely responsible for any
+> trading decisions. Each data source has its own terms of use (the Yahoo endpoint is unofficial and
+> meant for personal use); check them before relying on or redistributing data.
 
 ## Data sources
 
@@ -25,10 +34,15 @@ The app automatically slows polling to each source's free-tier limit.
 ## Setup
 
 ```bash
+git clone https://github.com/devnull5/quant_echo.git
+cd quant_echo
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-copy .env.example .env        # optional: fill in keys for the sources you use
+.venv\Scripts\pip install -e ".[schwab]"     # macOS/Linux: .venv/bin/pip install -e ".[schwab]"
+copy .env.example .env                        # optional: keys for the sources you use (cp on macOS/Linux)
 ```
+
+Drop `[schwab]` if you don't use Schwab. Yahoo and Simulated work with no keys at all.
+Tk ships with Python on Windows/macOS; on Linux install `python3-tk`.
 
 ### Local AI (Ollama)
 
@@ -103,3 +117,11 @@ python -m unittest discover -s tests -v
 ```
 
 Every provider is tested against recorded response shapes — no network or keys needed.
+
+## Contributing
+
+PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md), especially for adding a new data provider.
+
+## License
+
+[MIT](LICENSE) © Filip Mj (devnull5). Third-party models and data sources keep their own licenses/terms.

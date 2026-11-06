@@ -111,7 +111,7 @@ SYMBOL_RE = re.compile(r"\b[A-Z]{1,5}(?:/[A-Z]{2,4})?\b")
 API_KEY = os.getenv("SCHWAB_API_KEY", "")     # exact client id from portal
 APP_SECRET = os.getenv("SCHWAB_APP_SECRET", "")
 CALLBACK_URL = os.getenv("SCHWAB_CALLBACK_URL", "https://127.0.0.1:8182")
-TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", r"C:\Users\Filip\Projects\schwab_bot\tokens.json")
+TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", "tokens.json")
 # =====================================================
 
 # When any of these are passed as the model name, Ollama is treated as disabled

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantecho"
+version = "0.3.0"
+description = "Desktop market-data dashboard with intraday TA and local-LLM (Ollama) analysis. Read-only; never trades."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Filip Mj (devnull5)" }]
+dependencies = [
+    "httpx>=0.28",
+    "python-dotenv>=1.0",
+    "tzdata>=2024.1",
+]
+keywords = ["trading", "market-data", "technical-analysis", "ollama", "llm", "tkinter", "schwab", "yahoo-finance"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Environment :: X11 Applications :: Tk",
+]
+
+[project.optional-dependencies]
+schwab = ["schwab-py>=1.5,<2"]
+
+[project.urls]
+Homepage = "https://github.com/devnull5/quant_echo"
+Issues = "https://github.com/devnull5/quant_echo/issues"
+
+[project.gui-scripts]
+quantecho = "quantecho.gui:main"
+
+[project.scripts]
+quantecho-auth = "quantecho.auth:main"
+
+[tool.setuptools.packages.find]
+include = ["quantecho*"]
+
+[tool.ruff]
+line-length = 120
