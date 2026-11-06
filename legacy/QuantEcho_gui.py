@@ -1,4 +1,4 @@
-# final_llama.py — Dark dashboard UI with NEWS panel (quotes grid removed)
+# quantecho_gui.py — Dark dashboard UI with NEWS panel (quotes grid removed)
 from __future__ import annotations
 
 import io
@@ -13,15 +13,23 @@ import threading
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
-from contextlib import redirect_stdout, redirect_stderr, suppress
+from contextlib import redirect_stdout, redirect_stderr
 from typing import Any, TextIO, cast, Dict, List
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 import math
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import logging, subprocess
+from contextlib import suppress
+from news_client import (
+    NewsFetcher,
+    map_symbols_to_keywords,
+    compress_bullets,
+    news_bias_score,
+)
 
 RSI_RE  = re.compile(r"\bRSI(?:\s*\(\s*\d+\s*\))?\s*[:=]?\s*([+-]?\d+(?:\.\d+)?)", re.I)
-MACD_RE = re.compile(r"\bMACD(?:\s*\(\s*\d+\\s*\))?\s*[:=]?\s*([+-]?\d+(?:\.\d+)?)", re.I)
+MACD_RE = re.compile(r"\bMACD(?:\s*\(\s*\d+\s*\))?\s*[:=]?\s*([+-]?\d+(?:\.\d+)?)", re.I)
 VWAP_RE = re.compile(r"\bVWAP(?:\s*\(\s*\d+\s*\))?\s*[:=]?\s*([+-]?\d+(?:\.\d+)?)", re.I)
 def _coerce_int(x, default: int = 0) -> int:
     """Best-effort int; returns default on bad/NaN."""
@@ -65,7 +73,7 @@ try:
     core = cast(Any, core)
 except Exception as err:
     raise SystemExit(
-        "Could not import llama_drama.py. Make sure this GUI file is next to it.\n" + str(err)
+        "Could not import quantecho_core. Make sure this GUI file is next to it.\n" + str(err)
     )
 
 APP_NAME = "QuantEcho"
@@ -87,7 +95,7 @@ DEFAULTS = {
     "vwap_buf": 0.10,
     "gate_consecutive": 2,
     "print_gates": True,
-    "emit_json": False,
+    "emit_json": True,
     "csv_path": "",
     "ollama_model": os.getenv("OLLAMA_MODEL", "gpt-oss:20b"),
     "ollama_url": "http://127.0.0.1:11434",
@@ -98,7 +106,7 @@ DEFAULTS = {
     # --- NEWS options (GUI + backend passthrough) ---
     "news": bool(os.getenv("NEWSAPI_KEY", "")),  # enable by default when a key exists
     "news_since_h": 6,      # lookback window (hours)
-    "news_limit": 12,       # max items
+    "news_limit": 25,       # max items
     "news_weight": 0.30,    # bias nudge weight (0..1)
     "print_news": False,    # append a one-liner to prints
     "news_api_key": os.getenv("NEWS_API_KEY", ""),  # optional
@@ -287,6 +295,21 @@ def apply_dark_theme(root: tk.Tk) -> ttk.Style:
 
 # --------------------- UI ---------------------
 class App(tk.Tk):
+
+    def _ensure_headlines(self, k: int = 25) -> None:
+        """Fetch up to k headlines now; keep existing rows if fetch returns empty."""
+        if not self.params.get("news", False):
+            return
+        symbols = self.params.get("symbols", DEFAULTS["symbols"]).split()
+        keywords = map_symbols_to_keywords(symbols)
+        since_h = int(self.params.get("news_since_h", 6))
+        items = self.news_fetcher.get(keywords, since_hours=since_h, limit=int(k)) or []
+        if items:
+            self._news_rows = items  # keep last good copy
+        bias = news_bias_score(self._news_rows) if self._news_rows else 0.0
+        self._after_news_update(self._news_rows, bias)
+
+    status: ttk.Label  # created in _build_body
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
@@ -294,18 +317,78 @@ class App(tk.Tk):
         self.minsize(1080, 680)
         self.style = apply_dark_theme(self)
 
-        # state/config
+        # ✅ Load settings first
+        self.params = self._load_settings()
+
+        # ✅ Expose key so news_client can read it at call-time
+        if self.params.get("news_api_key"):
+            os.environ["NEWSAPI_KEY"] = self.params["news_api_key"]
+
+        # ✅ Now create the fetcher
+        self.news_fetcher = NewsFetcher(ttl_seconds=int(os.getenv("NEWS_TTL", "300")))
+        self._news_timer_id = None
+        self._news_rows: List[dict] = []
+
+        # rest unchanged...
         self.out_q: "queue.Queue[str]" = queue.Queue()
         self.loop_worker: LoopWorker | None = None
-        self.params = self._load_settings()
         self._awaiting_answer: bool = False
 
-        # build
         self._build_toolbar()
         self._build_body()
-
-        # log pump
         self.after(60, self._pump_output, ())
+
+    def _on_restart(self) -> None:
+        # show feedback and stop background stuff
+        self._toast("Restarting…")
+
+        # _on_stop may complain if timers/loop already stopped or UI is torn down
+        with suppress(tk.TclError, RuntimeError):
+            self._on_stop()
+
+        # schedule after Tk has a chance to process UI updates
+        try:
+            # callback takes no args
+            self.after(200, self._exec_restart)
+        except tk.TclError as e:
+            # If the widget is already destroyed, just restart immediately
+            logging.debug("after() failed; restarting immediately: %r", e)
+            self._exec_restart()
+
+    def _exec_restart(self) -> None:
+        # persist settings just in case — failures here shouldn't block a restart
+        with suppress(ValueError, AttributeError):
+            self._sync_vars_to_params()
+
+        # Typical save failures are filesystem-related; don't mask everything
+        try:
+            self._save_settings()
+        except (OSError, PermissionError) as e:
+            logging.warning("Saving settings failed; continuing with restart: %s", e)
+
+        # Build argv for relaunch (works for python and PyInstaller-frozen apps)
+        exe = sys.executable
+        args = [exe] + sys.argv[1:] if getattr(sys, "frozen", False) else [exe] + sys.argv
+
+        # Best: replace current process
+        try:
+            os.execv(exe, args)
+        except OSError as e:
+            logging.warning("execv failed (%s); falling back to spawn.", e)
+
+            # Fallback: spawn new, then hard-exit this process
+            try:
+                # close_fds True on POSIX; harmless on Windows
+                subprocess.Popen(args, close_fds=(os.name != "nt"))
+            except (OSError, FileNotFoundError) as e2:
+                logging.error("Failed to spawn replacement process: %s", e2)
+                # Try to surface the error to the user; fail silently if UI is gone
+                with suppress(Exception):
+                    from tkinter import messagebox
+                    messagebox.showerror("Restart failed", f"Couldn't restart:\n{e2}")
+                return
+
+            os._exit(0)  # exit immediately; avoid atexit handlers during restart
 
     # ---------- Telemetry -> UI ----------
     def _apply_telemetry(self, obj: dict) -> None:
@@ -461,7 +544,7 @@ class App(tk.Tk):
             sb_cls = getattr(ttk, "Spinbox", None) or tk.Spinbox
             return sb_cls(frm, from_=a, to=b, textvariable=var)
 
-        add_row(6, "Interval (s)", spin(self.var_interval, 5, 300))
+        add_row(6, "Interval (s)", spin(self.var_interval, 1, 300))
         add_row(7, "History pts", spin(self.var_history, 60, 10000))
         add_row(8, "Delta window", spin(self.var_window, 1, 50))
         add_row(9, "Min print Δ", ttk.Entry(frm, textvariable=self.var_min_print))
@@ -510,7 +593,12 @@ class App(tk.Tk):
         ttk.Button(
             buttons,
             text="Save",
-            command=lambda: (self._sync_vars_to_params(), self._save_settings(), win.destroy())
+            command=lambda: (
+                self._sync_vars_to_params(),
+                self._save_settings(),
+                self._apply_settings_changes(),  # <— add this
+                win.destroy()
+            )
         ).pack(side="right", padx=8)
 
     def _sync_vars_to_params(self) -> None:
@@ -548,6 +636,19 @@ class App(tk.Tk):
             "news_api_key": self.var_news_api_key.get().strip(),
         })
 
+    # inside class App, e.g. right after _sync_vars_to_params()
+
+    def _apply_settings_changes(self) -> None:
+        # keep env var in sync with the new key
+        if self.params.get("news_api_key"):
+            os.environ["NEWSAPI_KEY"] = self.params["news_api_key"]
+
+        # (re)start/stop the news loop to reflect toggle changes
+        if self.params.get("news", False):
+            self._start_news_loop()
+        else:
+            self._stop_news_loop()
+
     @staticmethod
     def _pick_path(var: tk.Variable, save: bool, default_extension: str = ".json") -> None:
         if save:
@@ -570,10 +671,17 @@ class App(tk.Tk):
         right = ttk.Frame(bar, style="Toolbar.TFrame")
         right.pack(side="right", padx=10, pady=8)
         ttk.Button(right, text="Settings", command=self._open_settings).pack(side="right")
+        ttk.Button(right, text="Restart", command=self._on_restart).pack(side="right", padx=(8, 0))
 
     def _build_body(self):
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
+
+        # ---- Status bar FIRST, so self.status always exists ----
+        status_bar = ttk.Frame(self, style="Toolbar.TFrame")
+        status_bar.pack(fill="x", side="bottom")
+        self.status = ttk.Label(status_bar, text="Ready", style="Title.TLabel")
+        self.status.pack(side="left", padx=12, pady=8)
 
         paned = ttk.Panedwindow(body, orient="horizontal")
         paned.pack(fill="both", expand=True)
@@ -628,23 +736,37 @@ class App(tk.Tk):
         for sym in self.params.get("symbols", DEFAULTS["symbols"]).split()[:5]:
             self._add_ticker_card(sym)
 
-        # NEWS panel (replaces quotes grid)
-        self._section(right, "NEWS")
+        # --- NEWS panel (replaces quotes grid) ---
+        hdr = ttk.Frame(right)
+        hdr.pack(fill="x", padx=12, pady=(12, 6))
+        ttk.Label(hdr, text="NEWS", style="Section.TLabel").pack(side="left")
+
+        # (optional) last-updated label
+        self.news_updated_lbl = ttk.Label(hdr, text="", style="Muted.TLabel")
+        self.news_updated_lbl.pack(side="left", padx=(10, 0))
+
+        ttk.Button(
+            hdr,
+            text="Refresh",
+            command=lambda: self._ensure_headlines(k=int(self.params.get("news_limit", 25)))
+        ).pack(side="right")
+
+        # Tree
         self.news_tree = ttk.Treeview(
             right,
             columns=("when", "src", "title", "sent"),
             show="headings",
             style="Quotes.Treeview",
         )
-        self.news_tree.heading("when",  text="WHEN")
-        self.news_tree.heading("src",   text="SRC")
+        self.news_tree.heading("when", text="WHEN")
+        self.news_tree.heading("src", text="SRC")
         self.news_tree.heading("title", text="TITLE")
-        self.news_tree.heading("sent",  text="SENT")
+        self.news_tree.heading("sent", text="SENT")
 
-        self.news_tree.column("when",  width=110, anchor="w")
-        self.news_tree.column("src",   width=100, anchor="w")
+        self.news_tree.column("when", width=110, anchor="w")
+        self.news_tree.column("src", width=100, anchor="w")
         self.news_tree.column("title", width=540, anchor="w")
-        self.news_tree.column("sent",  width=70,  anchor="e")
+        self.news_tree.column("sent", width=70, anchor="e")
 
         self.news_tree.pack(fill="both", expand=True, padx=12, pady=(2, 10))
         self._news_urls: Dict[str, str] = {}
@@ -657,15 +779,14 @@ class App(tk.Tk):
             url = self._news_urls.get(iid)
             if url:
                 webbrowser.open_new_tab(url)
+
         self.news_tree.bind("<Double-1>", _open_selected)
 
-        # status bar
-        status = ttk.Frame(self, style="Toolbar.TFrame")
-        status.pack(fill="x")
-        self.status = ttk.Label(status, text="Ready", style="Title.TLabel")
-        self.status.pack(side="left", padx=12, pady=8)
-
-        if self.params.get("news"):
+        # Start news loop immediately so the table fills without pressing Start
+        if self.params.get("news", False):
+            if self.params.get("news_api_key"):
+                os.environ["NEWSAPI_KEY"] = self.params["news_api_key"]
+            self._start_news_loop()
             self.status.configure(text="News on — double-click a headline to open")
             self.after(2500, self._set_ready, ())
 
@@ -738,7 +859,16 @@ class App(tk.Tk):
         self.prints_text.delete("1.0", tk.END)
         self.loop_worker = LoopWorker(self.out_q, self.params.copy())
         self.loop_worker.start()
+        if self.params.get("news"):
+            # make the API key available to news_client running in this process
+            if self.params.get("news_api_key"):
+                os.environ["NEWSAPI_KEY"] = self.params["news_api_key"]
+            self._start_news_loop()
+        else:
+            self._stop_news_loop()
+
         self._toast("Loop started")
+
 
     def _on_stop(self):
         if self.loop_worker:
@@ -748,23 +878,38 @@ class App(tk.Tk):
                     break
                 time.sleep(0.1)
         self._toast("Loop stopped")
+        self._stop_news_loop()
 
     def _on_ask(self):
         q = (self.ask_entry.get().strip()
              or self.params.get("question", DEFAULTS["question"]))
-        self.params["question"] = q
         self.ask_entry.delete(0, tk.END)
 
-        # Show the question in the chat panel right away
+        # show question in chat immediately
         self._append_chat("Q", q)
         self._awaiting_answer = True
 
-        worker = AskWorker(self.out_q, self.params.copy())
+        # make a copy we can safely mutate for this one ask
+        p = self.params.copy()
+        p["question"] = q  # do NOT persist augmented text to settings
+
+        # --- NEWS-aware ask: ensure top-25 are loaded first, then summarize those
+        lower_q = q.lower()
+        if self.params.get("news", False) and ("news" in lower_q or "headline" in lower_q):
+            # 1) force-fill headlines into UI + memory
+            self._ensure_headlines(k=25)  # keeps prior rows if fetch returns []
+
+            # 2) build context from exactly what's in memory / panel
+            ctx = self._news_context_for_ask(k=25)
+            words = int(self.params.get("qa_max_words", 120))
+            p["question"] = (
+                f"{q}\n\nUse ONLY the following headlines (newest first). "
+                f"Summarize in {words} words or fewer with 3–6 bullets and a 1-line bias.\n{ctx}"
+            )
+
+        worker = AskWorker(self.out_q, p)
         worker.start()
         self._toast("Asked")
-
-    # ---------- Output pump & parsing ----------
-    TIME_PAT = re.compile(r"(\[\d{2}:\d{2}:\d{2}])")
 
     def _pump_output(self, _args: tuple | None = None) -> None:
         try:
@@ -824,6 +969,9 @@ class App(tk.Tk):
             pass
         self.after(60, self._pump_output, ())
 
+    import re
+
+    TIME_PAT: re.Pattern[str] = re.compile(r"(\[\d{2}:\d{2}:\d{2}])")
     def _append_prints(self, text: str):
         t = self.prints_text
         pos = 0
@@ -878,27 +1026,7 @@ class App(tk.Tk):
                         v = float(vwap)
                         cast(ttk.Label, self.card_vwap["value"]).configure(text=self._fmt2(v))
 
-        m = RSI_RE.search(text)
-        if m:
-            rsi = float(m.group(1))
-            cast(ttk.Label, self.card_rsi["value"]).configure(text=self._fmt2(rsi))
-            state = "Overbought" if rsi >= 70 else "Oversold" if rsi <= 30 else "Neutral"
-            color_key = "red" if rsi >= 70 else "green" if rsi <= 30 else "muted"
-            cast(ttk.Label, self.card_rsi["status"]).configure(text=state, foreground=COLORS[color_key])
 
-        m = MACD_RE.search(text)
-        if m:
-            macd = float(m.group(1))
-            cast(ttk.Label, self.card_macd["value"]).configure(text=("+" if macd >= 0 else "") + self._fmt2(macd))
-            cast(ttk.Label, self.card_macd["status"]).configure(
-                text=("Bullish" if macd >= 0 else "Bearish"),
-                foreground=COLORS["green" if macd >= 0 else "red"],
-            )
-
-        m = VWAP_RE.search(text)
-        if m:
-            v = float(m.group(1))
-            cast(ttk.Label, self.card_vwap["value"]).configure(text=self._fmt2(v))
 
         if "above vwap" in text.lower():
             cast(ttk.Label, self.card_vwap["status"]).configure(text="Above", foreground=COLORS["blue"])
@@ -929,6 +1057,86 @@ class App(tk.Tk):
                 cast(ttk.Label, self.ticker_cards[sym]["last"]).configure(text=self._fmt2(p))
 
     # ---------- NEWS helpers ----------
+    def _start_news_loop(self) -> None:
+        # avoid double timers if re-enabled
+        self._stop_news_loop()
+        self._refresh_news_async()
+
+    def _stop_news_loop(self) -> None:
+        timer_id = getattr(self, "_news_timer_id", None)
+        if timer_id:
+            try:
+                self.after_cancel(timer_id)
+            except tk.TclError:
+                # already cancelled or widget destroyed
+                pass
+            finally:
+                self._news_timer_id = None
+
+    def _refresh_news_async(self) -> None:
+        """Fetch headlines in a worker thread, then update the Treeview."""
+        if not self.params.get("news", False):
+            return
+
+        symbols = self.params.get("symbols", DEFAULTS["symbols"]).split()
+        keywords = map_symbols_to_keywords(symbols)
+        since_h = int(self.params.get("news_since_h", 6))
+        limit = int(self.params.get("news_limit", 12))
+
+        def _worker():
+            items = self.news_fetcher.get(keywords, since_hours=since_h, limit=limit) or []
+            self._news_rows = items
+            bias = news_bias_score(items) if items else 0.0
+            self.after(0, self._after_news_update, items, bias)
+
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _after_news_update(self, items: List[dict], bias: float) -> None:
+        # 1) Update table (your _update_news_items should early-return on empty to keep rows)
+        self._update_news_items(items)
+
+        # 2) Decide what to reflect in the status: prefer last-good rows if fetch returned nothing
+        cur_rows = self._news_rows if getattr(self, "_news_rows", []) else (items or [])
+        cnt = len(cur_rows)
+        try:
+            bias_val = float(bias)
+        except (TypeError, ValueError):
+            bias_val = 0.0
+
+        # 3) Status + optional log line
+        self.status.configure(text=f"News: {cnt} items, bias {bias_val:+.2f}")
+        if cnt and bool(self.params.get("print_news", False)):
+            # print the first (newest) headline that is currently in the panel
+            line = (compress_bullets(cur_rows, k=1) or ["(news updated)"])[0]
+            self._append_prints(f"[{datetime.now().strftime('%H:%M:%S')}] News> {line}\n")
+
+        # 4) Last-updated label (if you added it in the header)
+        if hasattr(self, "news_updated_lbl"):
+            self.news_updated_lbl.configure(text=f"(updated {datetime.now().strftime('%H:%M')})")
+
+        # 5) Small UX toast reset
+        self.after(2500, self._set_ready, ())
+
+        # 6) Re-schedule (guard against duplicate timers)
+        refresh_every_s = max(90, int(self.params.get("interval", 20)) * 6)
+        if getattr(self, "_news_timer_id", None):
+            try:
+                self.after_cancel(self._news_timer_id)
+            except tk.TclError:
+                pass
+        self._news_timer_id = self.after(refresh_every_s * 1000, self._refresh_news_async)
+
+    def _news_context_for_ask(self, k: int = 12) -> str:
+        """Condense current headlines for Ollama when user asks about news."""
+        items = self._news_rows[: max(1, k)]
+        if not items:
+            return "(no headlines loaded)"
+        bullets = compress_bullets(items, k=len(items))
+        bias = news_bias_score(items)
+        tilt = "bearish" if bias < -0.25 else "bullish" if bias > 0.25 else "mixed"
+        return f"(headline bias: {bias:+.2f} → {tilt})\n" + "\n".join(bullets)
+
     def _update_news_items(self, items: List[dict[str, object]]) -> None:
         """
         Expects a list like:
@@ -937,7 +1145,35 @@ class App(tk.Tk):
           "sentiment": 0.23}, ...]
         Unknown fields are ignored gracefully.
         """
-        # Clear table and url map
+        # If nothing new came back, keep whatever is already displayed.
+        if not items:
+            return
+
+        # Newest-first ordering without broad try/except
+        def _ts_key(n: dict) -> float:
+            """Return a sortable UTC timestamp (seconds) for news item n."""
+            ts = n.get("published") or n.get("time") or n.get("ts")
+            if isinstance(ts, (int, float)):
+                try:
+                    return float(ts)
+                except (TypeError, ValueError):
+                    return 0.0
+            if isinstance(ts, str):
+                s = ts.strip()
+                try:
+                    # accept ISO8601 with/without trailing Z
+                    if s.endswith("Z"):
+                        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                    else:
+                        dt = datetime.fromisoformat(s)
+                    return dt.replace(tzinfo=timezone.utc).timestamp()
+                except (ValueError, OSError, TypeError):
+                    return 0.0
+            return 0.0
+
+        items = sorted(items, key=_ts_key, reverse=True)
+
+        # Clear table and URL map before inserting fresh rows
         for iid in self.news_tree.get_children(""):
             self.news_tree.delete(iid)
         self._news_urls.clear()
@@ -945,7 +1181,6 @@ class App(tk.Tk):
         def _fmt_when(ts: object) -> str:
             if ts is None:
                 return "—"
-
             # epoch seconds
             if isinstance(ts, (int, float)):
                 try:
@@ -953,7 +1188,6 @@ class App(tk.Tk):
                     return dt.astimezone().strftime("%H:%M")
                 except (ValueError, OSError, TypeError):
                     return "—"
-
             # ISO8601 string
             if isinstance(ts, str):
                 s = ts.strip()
@@ -965,45 +1199,32 @@ class App(tk.Tk):
                     return dt.astimezone().strftime("%H:%M")
                 except (ValueError, OSError, TypeError):
                     return s[:5] if len(s) >= 5 else (s or "—")
-
             return "—"
 
         def _fmt_sent(x: Any) -> str:
             """Return a +/−0.00 string or '—' if not parseable."""
             if x is None:
                 return "—"
-
-            # Fast path for real numbers
             if isinstance(x, (int, float)):
                 return f"{float(x):+.2f}"
-
-            # Strings like "0.12", "+0.4%", "  -1.0  "
             if isinstance(x, str):
                 s = x.strip().replace("%", "")
                 try:
                     return f"{float(s):+.2f}"
                 except (ValueError, TypeError):
-                    # Show the original string instead of crashing
                     return s if s else "—"
-
-            # Anything else (dict, list, objects) -> not parseable
             return "—"
 
         for it in items:
             title = str(it.get("title") or "—")
-            src   = str(it.get("source") or it.get("src") or "—")
-            url   = str(it.get("url") or "")
-            when  = _fmt_when(it.get("published") or it.get("time") or it.get("ts"))
-            sent  = _fmt_sent(it.get("sentiment") or it.get("bias"))
+            src = str(it.get("source") or it.get("src") or "—")
+            url = str(it.get("url") or "")
+            when = _fmt_when(it.get("published") or it.get("time") or it.get("ts"))
+            sent = _fmt_sent(it.get("sentiment") or it.get("bias"))
 
             iid = self.news_tree.insert(
                 "", "end",
-                values=(
-                    str(when),
-                    str(src),
-                    str(title),
-                    str(sent),
-                )
+                values=(str(when), str(src), str(title), str(sent))
             )
             if url:
                 self._news_urls[iid] = url

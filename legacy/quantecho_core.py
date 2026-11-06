@@ -30,14 +30,24 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from threading import Event, RLock
-from typing import Any, Dict, List, Optional, Tuple
-
+from typing import Any, List, Optional, Tuple
+from ai_openai_helper import OpenAIHelper
 import requests
 from requests.exceptions import RequestException, Timeout, ConnectionError as ReqConnectionError
 # ===== Formatting helpers (3 d.p. max) =====
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 # at top of file (near other env reads)
 DEBUG_QUOTE_FIELDS = os.getenv("DEBUG_QUOTE_FIELDS", "0") == "1"
+
+# ---- context_builder (optional) ----
+try:
+    from context_builder import build_context, compute_bias_score
+except ImportError:
+    build_context = None
+    compute_bias_score = None
+
+
+
 
 def fmt3(x, *, none="n/a"):
     """Return a string with up to 3 decimals (trim trailing zeros)."""
@@ -109,8 +119,8 @@ NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")  # export NEWSAPI_KEY=...
 SYMBOL_RE = re.compile(r"\b[A-Z]{1,5}(?:/[A-Z]{2,4})?\b")
 
 # ====== SCHWAB CREDS (set via env or edit here) ======
-API_KEY = os.getenv("SCHWAB_API_KEY", "")     # exact client id from portal
-APP_SECRET = os.getenv("SCHWAB_APP_SECRET", "")
+API_KEY = os.getenv("APP_KEY", "")     # exact client id from portal
+APP_SECRET = os.getenv("APP_SECRET", "")
 CALLBACK_URL = os.getenv("SCHWAB_CALLBACK_URL", "https://127.0.0.1:8182")
 TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", r"C:\Users\Filip\Projects\schwab_bot\tokens.json")
 # =====================================================
@@ -514,46 +524,262 @@ def ollama_summarize(prompt: str, model: str = "llama3", url: str = "http://127.
         log("(No Ollama summary)", e)
     return None
 
-def ollama_bias(telemetry: dict, model: str = "llama3", url: str = "http://127.0.0.1:11434", timeout: int = 45) -> Optional[Dict[str, object]]:
-    """Return {'bias': 'bullish|neutral|bearish', 'confidence': 0..1, 'rationale': str} or None."""
+from typing import Optional, Dict, Any  # ensure at top of file
+
+def ollama_bias(
+    telemetry: dict,
+    model: str = "llama3",
+    url: str = "http://127.0.0.1:11434",
+    timeout: int = 45,
+    verbose: bool = False,   # <— NEW
+) -> Optional[Dict[str, Any]]:
+    """
+    Return {'bias': 'bullish|neutral|bearish', 'confidence': 0..1, 'rationale': str} or None.
+    Prefers LLM JSON output; falls back to a deterministic vote if parsing fails.
+    """
+
+    # --- build strict JSON prompt ---
     prompt = (
-        "You are a veteran macro/quant trader. Using the TELEMETRY JSON, classify the immediate U.S. "
+        "You are a veteran macro/quant trader. Using TELEMETRY JSON, classify the IMMEDIATE U.S. "
         "equity market bias for short-term traders.\n"
-        "Use classic macro links: USD strength (DXY) vs equities, and yields (TNX) vs growth/QQQ.\n"
-        "If telemetry.ta exists, weigh technicals: RSI14; MACD vs signal/hist; BB position (bb_pos: -1..+1); "
-        "SMA5-20 tilt; VWAP relation.\n"
-        "If signals conflict, choose NEUTRAL with lower confidence.\n"
-        "STRICT JSON ONLY: {\"bias\":\"bullish|neutral|bearish\",\"confidence\":0..1,\"rationale\":\"<=20 words\"}\n\n"
+        "Weigh macro links (DXY↑=>eq↓, TNX↑=>growth↓), intraday VWAP relation for focus, and TA (RSI/MACD/BB). "
+        "Also consider CONTEXT.daily (200DMA, MA stack, 1w/1m returns, drawdown, vol percentile) and BIAS_CODE.score. "
+        "If signals conflict, choose NEUTRAL with lower confidence.\n\n"
+        "RESPONSE RULES (STRICT):\n"
+        " - Output ONE JSON object ONLY. No prose, no markdown, no code fences.\n"
+        " - Exact schema: {\"bias\":\"bullish|neutral|bearish\",\"confidence\":0..1,\"rationale\":\"<=12 words\"}\n\n"
         f"TELEMETRY:\n{json.dumps(telemetry, separators=(',', ':'))}"
     )
+
+    # --- call Ollama with JSON mode and low temperature ---
     try:
-        payload = {"model": model, "prompt": prompt, "stream": False, "keep_alive": "30m"}
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "keep_alive": "30m",
+            "format": "json",
+            "options": {"temperature": 0.1, "num_ctx": 2048},
+        }
         resp = _ollama_post(url, "/api/generate", payload, read_to=timeout)
         resp.raise_for_status()
         txt = (resp.json() or {}).get("response", "").strip()
     except (ReqConnectionError, Timeout, RequestException) as e:
-        log("(ollama_bias) error:", e)
+        if verbose:
+            log("(ollama_bias) request error:", e)
+        txt = ""
+
+    # --- helpers: safe JSON slice extraction (balanced braces, quote-aware) ---
+    def _extract_json_object_slice(s: str) -> str | None:
+        if not s:
+            return None
+        s = s.strip()
+        if s.startswith("```"):
+            s = s.strip("`\n\r ")
+        start = None
+        depth = 0
+        in_str = False
+        esc = False
+        for i, ch in enumerate(s):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        return s[start:i+1]
+        return None
+
+    # --- parse / sanitize any accidental wrappers ---
+    data: Optional[Dict[str, Any]] = None
+    if isinstance(txt, str) and txt.strip():
+        try:
+            candidate = _extract_json_object_slice(txt)
+            if candidate is not None:
+                data = json.loads(candidate)
+            else:
+                data = None  # no JSON object present → fall back deterministically
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            if verbose:
+                log(f"(ollama_bias) non-json reply; using fallback: {e.__class__.__name__}")
+            data = None
+
+    # --- validate LLM output ---
+    if isinstance(data, dict):
+        bias = str(data.get("bias", "")).lower()
+        if bias in {"bullish", "neutral", "bearish"}:
+            try:
+                conf = float(data.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                conf = 0.0
+            conf = max(0.0, min(1.0, conf))
+            rationale = str(data.get("rationale") or "").strip()
+            if rationale:
+                words = rationale.split()
+                if len(words) > 12:
+                    rationale = " ".join(words[:12])
+            return {"bias": bias, "confidence": conf, "rationale": rationale or "Signals mixed; keep risk tight"}
+
+    # --- deterministic fallback (votes from VWAP/MACD/DXY/TNX, with RSI dampener) ---
+    try:
+        f = telemetry.get("FOCUS") or telemetry.get("focus") or telemetry.get("focus_symbol")
+        px = telemetry.get("last_prices", {}).get(f)
+        vwap = telemetry.get("vwap", {}).get(f)
+        ta = telemetry.get("ta", {}) or telemetry.get("TA", {})
+        macd = ta.get("macd"); macd_sig = ta.get("macd_signal") or ta.get("signal")
+        rsi = ta.get("rsi14") or ta.get("rsi")
+        dxy_d = telemetry.get("macro", {}).get("dxy_delta")
+        tnx_d = telemetry.get("macro", {}).get("tnx_delta")
+
+        votes = 0.0
+        if px is not None and vwap is not None:
+            votes += 1 if px > vwap else -1 if px < vwap else 0
+        if macd is not None and macd_sig is not None:
+            votes += 1 if macd >= macd_sig else -1
+        if dxy_d is not None:
+            votes += -1 if dxy_d > 0 else 1 if dxy_d < 0 else 0
+        if tnx_d is not None:
+            votes += -1 if tnx_d > 0 else 1 if tnx_d < 0 else 0
+        if rsi is not None:
+            votes += -0.5 if rsi >= 70 else 0.5 if rsi <= 30 else 0
+
+        if votes >= 1.5:
+            fb_bias = "bullish"
+        elif votes <= -1.5:
+            fb_bias = "bearish"
+        else:
+            fb_bias = "neutral"
+
+        features = sum(x is not None for x in [px, vwap, macd, macd_sig, dxy_d, tnx_d, rsi])
+        base_conf = min(0.9, 0.35 + 0.1 * max(0, features - 2))
+        conf = max(0.3, min(0.9, base_conf * (1 + 0.25 * abs(votes))))
+
+        rationale = (
+            "Above VWAP & MACD≥sig" if fb_bias == "bullish" else
+            "Below VWAP & MACD≤sig" if fb_bias == "bearish" else
+            "Mixed VWAP/MACD/macro"
+        )
+        if rsi is not None and ((fb_bias == "bullish" and rsi >= 70) or (fb_bias == "bearish" and rsi <= 30)):
+            rationale += "; RSI extreme"
+
+        return {"bias": fb_bias, "confidence": round(conf, 3), "rationale": rationale}
+    except (KeyError, TypeError, ValueError, ArithmeticError) as e:
+        if verbose:
+            log("(ollama_bias) fallback error:", e)
+        return None
+
+
+def ollama_trade_plan(telemetry: dict, model: str = "llama3", url: str = "http://127.0.0.1:11434", timeout: int = 45) -> Optional[Dict[str, object]]:
+    """
+    Return a minimal, executable plan:
+      {
+        "action": "long|short|wait",
+        "timeframe": "scalp|intra|swing",
+        "entry": "string (<= 8 words)",
+        "stop": "string (<= 8 words)",
+        "take_profit": "string (<= 8 words)",
+        "bias": "bullish|neutral|bearish",
+        "confidence": 0..1,
+        "note": "string (<= 10 words)"
+      }
+    """
+    # Short, rulesy prompt: no essays, just the plan.
+    prompt = (
+        "You are a veteran macro/quant day trader. Using TELEMETRY JSON, output a one-glance trading plan "
+        "for short-term U.S. equities. Prioritize VWAP relation, RSI/MACD/BB, and macro links (DXY↑=>eq↓, TNX↑=>growth↓). "
+        "If signals conflict or edge is thin, choose action=wait and lower confidence.\n\n"
+        "STRICT JSON ONLY with EXACT keys and formats:\n"
+        "{"
+        "\"action\":\"long|short|wait\","
+        "\"timeframe\":\"scalp|intra|swing\","
+        "\"entry\":\"<=8 words\","
+        "\"stop\":\"<=8 words\","
+        "\"take_profit\":\"<=8 words\","
+        "\"bias\":\"bullish|neutral|bearish\","
+        "\"confidence\":0..1,"
+        "\"note\":\"<=10 words\""
+        "}\n\n"
+        f"TELEMETRY:\n{json.dumps(telemetry, separators=(',', ':'))}"
+    )
+
+    try:
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "keep_alive": "30m",
+            # Ask Ollama to format JSON; if unsupported by your model, it will be ignored harmlessly.
+            "format": "json",
+            "options": {"temperature": 0.2}
+        }
+        resp = _ollama_post(url, "/api/generate", payload, read_to=timeout)
+        resp.raise_for_status()
+        txt = (resp.json() or {}).get("response", "").strip()
+    except (ReqConnectionError, Timeout, RequestException) as e:
+        log("(ollama_trade_plan) error:", e)
         return None
 
     try:
+        # Be forgiving if the model adds text around the JSON.
         start, end = txt.find("{"), txt.rfind("}")
         if start != -1 and end != -1:
-            txt = txt[start : end + 1]
+            txt = txt[start:end+1]
         data = json.loads(txt)
     except Exception as e:
-        log("(ollama_bias) bad JSON:", e)
+        log("(ollama_trade_plan) bad JSON:", e)
         return None
+
+    # Validate / coerce
+    action = str(data.get("action", "")).lower()
+    if action not in {"long", "short", "wait"}:
+        action = "wait"
+
+    timeframe = str(data.get("timeframe", "")).lower()
+    if timeframe not in {"scalp", "intra", "swing"}:
+        timeframe = "intra"
 
     bias = str(data.get("bias", "")).lower()
     if bias not in {"bullish", "neutral", "bearish"}:
-        return None
+        bias = "neutral"
+
     try:
         conf = float(data.get("confidence", 0))
     except (TypeError, ValueError):
         conf = 0.0
     conf = max(0.0, min(1.0, conf))
-    rationale = str(data.get("rationale") or "").strip()
-    return {"bias": bias, "confidence": conf, "rationale": rationale}
+
+    entry = str(data.get("entry") or "").strip()
+    stop = str(data.get("stop") or "").strip()
+    tp = str(data.get("take_profit") or "").strip()
+    note = str(data.get("note") or "").strip()
+
+    return {
+        "action": action,
+        "timeframe": timeframe,
+        "entry": entry[:64],
+        "stop": stop[:64],
+        "take_profit": tp[:64],
+        "bias": bias,
+        "confidence": conf,
+        "note": note[:64],
+    }
+
+
+
+
 
 # =========================== Market Logic (+ VWAP) ===========================
 
@@ -1295,6 +1521,35 @@ def qa_chat(provider: BaseQuoteProvider, user_symbols: List[str], focus: str, mo
     sampler = BackgroundSampler(provider, display_symbols, brain, interval=interval)
     sampler.start()
 
+    from typing import Any, Dict, Optional
+
+    # --- helper to format/print concise plan ---
+    def _print_plan(trade_plan: Optional[Dict[str, Any]]) -> None:
+        if not trade_plan:
+            print("WAIT (—%) — intra\nEntry: — | Stop: — | TP: —\nBias: neutral | Note: No clear edge\n")
+            return
+
+        # safely coerce confidence -> int%
+        conf_val = trade_plan.get("confidence", 0.0)
+        try:
+            pct = int(round(float(conf_val) * 100))
+        except (TypeError, ValueError):
+            pct = 0
+
+        action = str(trade_plan.get("action", "wait")).upper()
+        timeframe = str(trade_plan.get("timeframe", "intra"))
+        entry_txt = str(trade_plan.get("entry", "—"))
+        stop_txt = str(trade_plan.get("stop", "—"))  # renamed to avoid shadowing
+        tp_txt = str(trade_plan.get("take_profit", "—"))
+        bias_txt = str(trade_plan.get("bias", "neutral"))
+        note_raw = trade_plan.get("note", "—")
+        note_txt = "—" if note_raw in (None, "") else str(note_raw)
+
+        line1 = f"{action} ({pct}%) — {timeframe}"
+        line2 = f"Entry: {entry_txt} | Stop: {stop_txt} | TP: {tp_txt}"
+        line3 = f"Bias: {bias_txt} | Note: {note_txt}"
+        print(f"{line1}\n{line2}\n{line3}\n")
+
     print("Q&A chat — type 'help' for commands; 'quit' to leave.")
     try:
         while True:
@@ -1307,14 +1562,22 @@ def qa_chat(provider: BaseQuoteProvider, user_symbols: List[str], focus: str, mo
                 continue
 
             cmd = q.lower().strip()
+
             if cmd in {"quit", "exit", "q"}:
                 break
+
             if cmd in {"help", "h", "?"}:
-                print(CHAT_HELP, "\n"); continue
+                print(CHAT_HELP, "\n")
+                continue
+
             if cmd in {"time", "now"}:
-                print(f"{virginia_now_str()}\n"); continue
+                print(f"{virginia_now_str()}\n")
+                continue
+
             if cmd in {"tele", "telemetry"}:
-                print(json.dumps(_build_telemetry_for_qa(brain), indent=2), "\n"); continue
+                print(json.dumps(_build_telemetry_for_qa(brain), indent=2), "\n")
+                continue
+
             if cmd == "gates":
                 ok_c, why_c, trig_c = brain.pre_order_check("calls")
                 ok_p, why_p, trig_p = brain.pre_order_check("puts")
@@ -1322,7 +1585,9 @@ def qa_chat(provider: BaseQuoteProvider, user_symbols: List[str], focus: str, mo
                     "calls": {"ok": ok_c, "why": why_c, "triggers": trig_c},
                     "puts": {"ok": ok_p, "why": why_p, "triggers": trig_p},
                     "params": {"vwap_buf": brain.vwap_buf, "consecutive": brain.gate_consecutive}
-                }, indent=2), "\n"); continue
+                }, indent=2), "\n")
+                continue
+
             if cmd == "snap":
                 f = brain.focus
                 px = brain.latest_prices().get(f)
@@ -1345,38 +1610,96 @@ def qa_chat(provider: BaseQuoteProvider, user_symbols: List[str], focus: str, mo
                 print("\n".join(lines) + "\n"); continue
             if cmd in {"ind", "indicators"}:
                 print(_indicators_block(brain) + "\n"); continue
+
+            # --- patched: concise trading plan instead of verbose narrative ---
             if cmd in {"analysis", "market analysis", "status"}:
-                text = brain.narrative(
-                    display_symbols,
-                    ollama_model=model, ollama_url=url, ollama_timeout=timeout,
-                    structured=True, include_extras=False
-                )
-                print(text + "\n"); continue
-
-            if cmd.startswith(("plan long", "plan short")):
-                side = "long" if "long" in cmd else "short"
-                ta = brain.ta_pack()
-                f = brain.focus
-                px = brain.latest_prices().get(f)
-                vwap = brain.latest_vwap().get(f)
-                bb_mid, bb_up, bb_lo = ta.get("bb_mid"), ta.get("bb_up"), ta.get("bb_lo")
-                buf = max(brain.vwap_buf, 0.35)
-                if None in (px, vwap, bb_mid, bb_up, bb_lo):
-                    print("Plan unavailable (need VWAP and BB).\n"); continue
-                if side == "long":
-                    stop = vwap - buf; tgt = (bb_up or px) + 0.20
-                    print(f"LONG  | px {fmt3(px)} vwap {fmt3(vwap)} | stop {fmt3(stop)} | tgt {fmt3(tgt)} | mid {fmt3(bb_mid)}")
-
+                telemetry = _build_telemetry_for_qa(brain)
+                plan = ollama_trade_plan(telemetry, model=model, url=url, timeout=timeout)
+                if plan:
+                    _print_plan(plan)
                 else:
-                    stop = vwap + buf; tgt = (bb_lo or px) - 0.20
-                    print(f"SHORT | px {fmt3(px)} vwap {fmt3(vwap)} | stop {fmt3(stop)} | tgt {fmt3(tgt)} | mid {fmt3(bb_mid)}")
+                    # deterministic fallback if LLM unavailable
+                    ta = brain.ta_pack()
+                    f = brain.focus
+                    px = brain.latest_prices().get(f)
+                    vwap = brain.latest_vwap().get(f)
+                    buf = max(brain.vwap_buf, 0.35)
+                    if None in (px, vwap) or ta.get("bb_up") is None or ta.get("bb_lo") is None:
+                        print("WAIT (—%) — intra\nEntry: — | Stop: — | TP: —\nBias: neutral | Note: Need VWAP/BB\n")
+                    else:
+                        # quick heuristic: above vwap & macd>0 => long, below vwap & macd<0 => short, else wait
+                        macd, signal = ta.get("macd"), ta.get("macd_signal")
+                        if px > vwap and (macd is not None and signal is not None and macd >= signal):
+                            stop = vwap - buf; tgt = ta["bb_up"] + 0.20
+                            print(f"LONG (—%) — intra\nEntry: buy pullback to VWAP\nStop: {fmt3(stop)}\nTP: {fmt3(tgt)}\nBias: bullish | Note: Above VWAP + MACD≥sig\n")
+                        elif px < vwap and (macd is not None and signal is not None and macd <= signal):
+                            stop = vwap + buf; tgt = ta["bb_lo"] - 0.20
+                            print(f"SHORT (—%) — intra\nEntry: sell bounce to VWAP\nStop: {fmt3(stop)}\nTP: {fmt3(tgt)}\nBias: bearish | Note: Below VWAP + MACD≤sig\n")
+                        else:
+                            print("WAIT (—%) — intra\nEntry: — | Stop: — | TP: —\nBias: neutral | Note: No confluence\n")
                 continue
 
+            # --- new: explicit 'plan' command for quick plan anytime ---
+            if cmd in {"plan", "trade plan"}:
+                telemetry = _build_telemetry_for_qa(brain)
+                plan = ollama_trade_plan(telemetry, model=model, url=url, timeout=timeout)
+                _print_plan(plan)
+                continue
+
+            # --- unified 'plan' command family (handles: 'plan', 'trade plan', 'plan long', 'plan  short now', etc.) ---
+            if cmd.startswith("plan") or cmd in {"trade plan"}:
+                # normalize (tolerates extra spaces/words)
+                cmd_spaced = f" {cmd} "
+                want_long = " long" in cmd_spaced
+                want_short = " short" in cmd_spaced
+
+                if want_long or want_short:
+                    side = "long" if want_long else "short"
+                    ta = brain.ta_pack()
+                    f = brain.focus
+                    px = brain.latest_prices().get(f)
+                    vwap = brain.latest_vwap().get(f)
+                    bb_mid = ta.get("bb_mid")
+                    bb_up = ta.get("bb_up")
+                    bb_lo = ta.get("bb_lo")
+                    buf = max(brain.vwap_buf, 0.35)
+
+                    if None in (px, vwap, bb_mid, bb_up, bb_lo):
+                        print("WAIT (—%) — intra\nEntry: — | Stop: — | TP: —\nBias: neutral | Note: Need VWAP/BB\n")
+                    else:
+                        if side == "long":
+                            stop_px = vwap - buf
+                            tgt_px = (bb_up or px) + 0.20
+                            print(
+                                f"LONG (—%) — intra\n"
+                                f"Entry: buy pullback to VWAP | Stop: {fmt3(stop_px)} | TP: {fmt3(tgt_px)}\n"
+                                f"Bias: bullish | Note: Above VWAP or MACD≥sig\n"
+                            )
+                        else:
+                            stop_px = vwap + buf
+                            tgt_px = (bb_lo or px) - 0.20
+                            print(
+                                f"SHORT (—%) — intra\n"
+                                f"Entry: sell bounce to VWAP | Stop: {fmt3(stop_px)} | TP: {fmt3(tgt_px)}\n"
+                                f"Bias: bearish | Note: Below VWAP or MACD≤sig\n"
+                            )
+                    print()  # ensure newline
+                    continue
+
+                # generic 'plan' -> use LLM JSON plan (SINGLE copy — do not repeat)
+                telemetry = _build_telemetry_for_qa(brain)
+                plan = ollama_trade_plan(telemetry, model=model, url=url, timeout=timeout)
+                _print_plan(plan if isinstance(plan, dict) else None)
+                continue
+
+            # default: send to QA answerer
             telemetry = _build_telemetry_for_qa(brain)
             ans = ollama_answer(q, telemetry, model=model, url=url, timeout=timeout, max_words=max_words)
             print(f"A> {ans}\n" if ans else "A> (no answer — Ollama disabled or request failed)\n")
+
     finally:
         sampler.stop()
+
 
 # =========================== Loop ===========================
 
@@ -1424,7 +1747,7 @@ class TickerLoop:
         self.display_symbols = expand_symbols(symbols)  # includes UUP/IEF/TLT
         self.request_symbols = normalize_provider_symbols(self.display_symbols)  # filtered for Schwab
         self.provider = provider
-        self.interval = max(5, int(interval))
+        self.interval = max(1, int(interval))  # allow 1s loops for snappy GUI
         self.brain = MarketBrain(focus=focus)
         self.brain.vwap_buf = float(vwap_buf)
         self.brain.gate_consecutive = int(gate_consecutive)
@@ -1527,6 +1850,23 @@ class TickerLoop:
         tnx_d = self.brain.pct_delta("TNX")
         ta = self.brain.ta_pack()
 
+        # --- Optional compact context (daily+intraday) for focus symbol ---
+        ctx = None
+        bias_code = None
+        # Avoid type-checker grief: provider is typed BaseQuoteProvider, but SchwabQuoteProvider has .client
+        schwab_client = getattr(self.provider, "client", None)
+        if schwab_client is not None and callable(build_context):
+            try:
+                ctx = build_context(schwab_client, f)
+            except Exception as e:
+                log("(context) build_context error:", e)
+
+        if ctx is not None and callable(compute_bias_score):
+            try:
+                bias_code = {"score": round(float(compute_bias_score(ctx)), 2)}
+            except Exception as e:
+                log("(context) compute_bias_score error:", e)
+
         pruned_px: Dict[str, float] = {k: v for k, v in px.items() if v is not None}
         payload: Dict[str, Any] = {
             "t": time.time(),
@@ -1539,32 +1879,11 @@ class TickerLoop:
             "ai": None,
             "gates": None,
             "news": None,
+            "context": ctx,  # <= defined above (or None)
+            "bias_code": bias_code,  # <= defined above (or None)
         }
+
         bias = 0.0  # default news bias
-
-        # --- Optional news fetch (we’ll reuse this both for the model prompt and GUI) ---
-        # --- Optional news fetch (for both model and GUI) ---
-        news_for_prompt = None  # compact form for LLM
-        if self.news_on:
-            items, bias, bullets = self._get_news()
-
-            # For the GUI (expects "items")
-            payload["news"] = {
-                "count": len(items) if isinstance(items, list) else 0,
-                "bias": bias,
-                "items": items or [],  # <-- IMPORTANT: "items", not only "bullets"
-            }
-
-            # If you also want to feed the model a compact form:
-            # (wherever you build the prompt)
-            news_for_prompt = {
-                "bias": bias,
-                "bullets": bullets,  # <-- list, no slicing characters
-            }
-
-
-
-
 
         # --- Build telemetry for the model (now includes compact news) ---
         if str(self.ollama_model).strip().lower() not in OLLAMA_DISABLED:
@@ -1586,8 +1905,11 @@ class TickerLoop:
                 "ta": round_floats(ta, 3),
                 "vwap": round_floats({k: v for k, v in vwp.items() if k in pruned_disp or k == f}, 3),
             }
-            if news_for_prompt is not None:
-                telemetry["news"] = news_for_prompt  # <<--- NEW: let the model “see” news
+            # Attach context + bias_code to the model too
+            if ctx is not None:
+                telemetry["context"] = ctx
+            if bias_code is not None:
+                telemetry["bias_code"] = bias_code
 
             ai = ollama_bias(
                 telemetry,
