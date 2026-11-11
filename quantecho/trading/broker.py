@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 from ..logsetup import log
 from .occ import OptionContract, parse_occ
 from .pricing import OptionQuote, model_quote, synthetic_chain
-from .tasty import TastytradeClient, build_option_order
+from .tasty import DEFAULT_TICKS, PENNY_ALL, TastytradeClient, TickRules, build_option_order, round_to_tick
 
 Chain = Dict[date, Dict[float, Dict[str, str]]]
 
@@ -26,6 +26,13 @@ class OrderResult:
 class Broker:
     name = "broker"
     real_money = False
+
+    def tick_rules(self, root: str) -> TickRules:
+        return [(None, 0.01)] if root.upper() in PENNY_ALL else DEFAULT_TICKS
+
+    def round_price(self, c: OptionContract, price: float, buy: bool) -> float:
+        """Valid limit for this contract (buys round up, sells down)."""
+        return round_to_tick(price, self.tick_rules(c.root), up=buy)
 
     def chain(self, root: str, spot: float) -> Chain: ...
     def quote(self, c: OptionContract, spot: float) -> OptionQuote: ...
@@ -141,6 +148,9 @@ class TastyBroker(Broker):
 
     def chain(self, root: str, spot: float) -> Chain:
         return {e.expiry: e.strikes for e in self.client.option_chain(root)}
+
+    def tick_rules(self, root: str) -> TickRules:
+        return self.client.tick_rules.get(root.upper()) or super().tick_rules(root)
 
     def quote(self, c: OptionContract, spot: float) -> OptionQuote:
         if self.quote_client is not None:   # production read-only credentials -> real quotes

@@ -153,8 +153,10 @@ because nothing manages them after the bot stops.
 **tastytrade setup** (OAuth2; the old username/password login was retired in 2026): create an OAuth
 application and a grant at my.tastytrade.com (Manage → My Profile → API) to get a **client secret** and
 **refresh token**. The sandbox needs its own sandbox account and credentials (developer.tastytrade.com/sandbox).
-The sandbox has no market data, so sandbox mode uses modeled prices to choose limits unless you also provide
-read-only production credentials for real quotes.
+The sandbox's market data is static placeholder values (not real prices), so sandbox mode uses modeled
+prices to choose limits unless you also provide read-only production credentials for real quotes.
+Limit prices are rounded to each underlying's tick sizes from the chain (e.g. NVDA options: $0.05 at/above
+$3, $0.01 below).
 
 ## Run
 

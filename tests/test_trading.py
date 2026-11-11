@@ -336,5 +336,47 @@ class TestBotConfluence(unittest.TestCase):
             tmp.cleanup()
 
 
+class TestTickSizes(unittest.TestCase):
+    NVDA_RULES_JSON = {"tick-sizes": [{"threshold": "3.0", "value": "0.01"}, {"value": "0.05"}]}  # real sandbox data
+
+    def test_parse_real_tick_sizes(self):
+        from quantecho.trading.tasty import parse_tick_sizes
+        self.assertEqual(parse_tick_sizes(self.NVDA_RULES_JSON), [(3.0, 0.01), (None, 0.05)])
+        self.assertEqual(parse_tick_sizes({"tick-sizes": [{"value": "0.01"}]}), [(None, 0.01)])  # SPY
+
+    def test_rounding(self):
+        from quantecho.trading.tasty import parse_tick_sizes, round_to_tick
+        r = parse_tick_sizes(self.NVDA_RULES_JSON)
+        self.assertEqual(round_to_tick(4.62, r, up=True), 4.65)      # >= $3 -> $0.05 steps, buys round up
+        self.assertEqual(round_to_tick(4.62, r, up=False), 4.60)     # sells round down
+        self.assertEqual(round_to_tick(2.513, r, up=True), 2.52)     # < $3 -> pennies
+        self.assertEqual(round_to_tick(2.999, r, up=True), 3.00)     # crossing the threshold stays valid
+        self.assertEqual(round_to_tick(3.00, r, up=True), 3.00)
+        self.assertEqual(round_to_tick(0.004, r, up=False), 0.01)    # never below one tick
+
+    def test_brokers_round(self):
+        from quantecho.trading.broker import SimBroker
+        b = SimBroker()
+        nv = OptionContract("NVDA", date(2026, 11, 18), "C", 185)
+        spy = OptionContract("SPY", date(2026, 11, 18), "C", 600)
+        self.assertEqual(b.round_price(nv, 4.62, buy=True), 4.65)
+        self.assertEqual(b.round_price(spy, 4.62, buy=True), 4.62)   # SPY trades in pennies throughout
+
+    def test_tasty_broker_uses_chain_ticks(self):
+        f = FakeTasty()
+        c = TastytradeClient("sandbox", "CS", "RT", http=f)
+        orig = f.request
+
+        def with_ticks(method, url, **kw):
+            r = orig(method, url, **kw)
+            if "/option-chains/" in url:
+                r._p["data"]["items"][0]["tick-sizes"] = [{"value": "0.05"}]
+            return r
+        f.request = with_ticks
+        b = TastyBroker(c)
+        b.chain("SPY", 600)
+        self.assertEqual(b.round_price(OptionContract("SPY", date(2026, 11, 18), "C", 600), 1.01, buy=True), 1.05)
+
+
 if __name__ == "__main__":
     unittest.main()

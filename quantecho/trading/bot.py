@@ -209,7 +209,7 @@ class TradingBot:
             self.journal("skip", symbol=sym, reason="no expiry/strike in DTE window")
             return
         q = self.broker.quote(c, spot)
-        price = entry_limit(q.bid, q.ask)
+        price = self.broker.round_price(c, entry_limit(q.bid, q.ask), buy=True)
         open_syms = list(self.positions) + [p.contract.root for p in self.pending.values()]
         ok, why = check_entry(self.limits, self.state, sym, open_syms, price, q.spread_pct,
                               sum(p.pnl for p in self.positions.values()), now)
@@ -253,7 +253,7 @@ class TradingBot:
             self._exit(p, q, why, urgent=p.urgent_exit or why.startswith(("stop", "flatten", "kill")))
 
     def _exit(self, p: Position, q, why: str, urgent: bool) -> None:
-        price = exit_limit(q.bid, q.ask, urgent)
+        price = self.broker.round_price(p.contract, exit_limit(q.bid, q.ask, urgent), buy=False)
         ext = new_external_id()
         try:
             r = self.broker.submit(p.contract, "Sell to Close", p.qty, price, ext)

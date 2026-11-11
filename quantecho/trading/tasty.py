@@ -6,8 +6,11 @@ refresh_token, client_secret; 15-minute JWT access tokens; refresh token does no
 User-Agent, order JSON (dasherized keys, decimal strings), POST /accounts/{n}/orders[/dry-run],
 DELETE/GET /accounts/{n}/orders/{id}, GET .../orders/live, positions, balances, /market-data/by-type.
 
-NOT verified on the docs pages read (taken from tastytrade's SDK conventions; confirm on first sandbox run):
-nested option-chain field names, and the accounts list endpoint (/customers/me/accounts).
+Verified live against the sandbox (2026-11-11): /customers/me/accounts (items[].account.account-number),
+nested chain fields (expiration-date, days-to-expiration, strikes[].strike-price/call/put), chain
+'tick-sizes' ([{threshold, value}] e.g. NVDA $0.01 < $3, $0.05 >= $3; SPY $0.01), dry-run acceptance.
+NOTE: sandbox /market-data returns STATIC PLACEHOLDER quotes (e.g. NVDA 99.95/100.05, updated-at
+2026-01-01); never use them as prices. Limits must respect tick sizes (invalid_price_increment otherwise).
 
 Safety: the API does not deduplicate retries. Every order carries a unique `external-identifier`; a
 submit that times out is NEVER blindly resent: we look the identifier up first (see place_order).
@@ -18,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..logsetup import log
 from ..providers.base import AuthError, ProviderError, RateLimited, http_error
@@ -69,6 +72,46 @@ def parse_nested_chain(payload: Any) -> List[Expiration]:
     return sorted(out, key=lambda x: x.expiry)
 
 
+TickRules = List[Tuple[Optional[float], float]]   # [(threshold, tick)], threshold None = "and above"
+
+# Standard US equity-option tick rules when the chain doesn't say: $0.01 under $3, $0.05 at/above $3,
+# except penny-program index ETFs that trade in $0.01 throughout.
+DEFAULT_TICKS: TickRules = [(3.0, 0.01), (None, 0.05)]
+PENNY_ALL = {"SPY", "QQQ", "IWM"}
+
+
+def parse_tick_sizes(item: Dict[str, Any]) -> TickRules:
+    """tastytrade chain 'tick-sizes': [{"threshold": "3.0", "value": "0.01"}, {"value": "0.05"}]."""
+    out: TickRules = []
+    for t in item.get("tick-sizes") or []:
+        try:
+            v = float(t["value"])
+            th = float(t["threshold"]) if t.get("threshold") not in (None, "") else None
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append((th, v))
+    return sorted(out, key=lambda r: (r[0] is None, r[0] or 0))
+
+
+def tick_for(price: float, rules: TickRules) -> float:
+    for th, v in rules:
+        if th is None or price < th:
+            return v
+    return rules[-1][1] if rules else 0.01
+
+
+def round_to_tick(price: float, rules: TickRules, up: bool) -> float:
+    """Round a limit to a valid increment: buys round UP (stay fillable), sells round DOWN."""
+    import math
+    tick = tick_for(price, rules or DEFAULT_TICKS)
+    n = price / tick
+    n = math.ceil(n - 1e-9) if up else math.floor(n + 1e-9)
+    out = round(max(tick, n * tick), 2)
+    if (rules or DEFAULT_TICKS) and up and tick_for(out, rules or DEFAULT_TICKS) != tick:   # crossed a threshold
+        return round_to_tick(out, rules, up)
+    return out
+
+
 def build_option_order(symbol: str, action: str, quantity: int, limit: float, ext_id: str,
                        tif: str = "Day") -> Dict[str, Any]:
     """Single-leg equity-option LIMIT order. Buying is a Debit, selling a Credit (API rejects mismatches)."""
@@ -110,6 +153,7 @@ class TastytradeClient:
                                                                   "Accept": "application/json"})
         self._token: Optional[str] = None
         self._token_exp = 0.0
+        self.tick_rules: Dict[str, TickRules] = {}
 
     # ---------------------------------------------------------------- auth + transport
     def _redact(self, text: str) -> str:
@@ -188,7 +232,11 @@ class TastytradeClient:
         return (p.get("data") or {}).get("items") or []
 
     def option_chain(self, underlying: str) -> List[Expiration]:
-        return parse_nested_chain(self._request("GET", f"/option-chains/{underlying.upper()}/nested", retries=2))
+        raw = self._request("GET", f"/option-chains/{underlying.upper()}/nested", retries=2)
+        items = (raw.get("data") or {}).get("items") or []
+        if items:
+            self.tick_rules[underlying.upper()] = parse_tick_sizes(items[0]) or DEFAULT_TICKS
+        return parse_nested_chain(raw)
 
     def quotes(self, equities: List[str] = (), options: List[str] = ()) -> Dict[str, Dict[str, Any]]:
         """REST snapshot (PRODUCTION only; the sandbox returns 502 for market data). Max 100 symbols."""
