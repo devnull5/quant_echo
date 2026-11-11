@@ -61,5 +61,6 @@ SPEC = ProviderSpec(
     factory=lambda c: SimulatedProvider(),
     notes="Fake random-walk prices for trying the app with no keys or internet. Not real data!",
     min_interval=1,
+    focus_tick_s=0.5,
     min_bars_every=30,
 )

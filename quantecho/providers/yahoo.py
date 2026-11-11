@@ -157,6 +157,7 @@ SPEC = ProviderSpec(
     notes="PERSONAL USE ONLY: unofficial endpoint whose terms don't allow redistribution. No signup; may "
           "rate-limit or change without notice.",
     min_interval=10,
+    focus_tick_s=3,
     personal_use_only=True,
     clip_volume_spikes=True,  # Yahoo 1-min data has occasional 50-100x phantom volume bars
 )

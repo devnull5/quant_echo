@@ -9,7 +9,7 @@ a = Analysis(
     [str(ROOT / "packaging" / "quantecho_app.py")],
     pathex=[str(ROOT)],
     datas=[(str(ROOT / "quantecho" / "assets"), "quantecho/assets"), *collect_data_files("tzdata")],
-    hiddenimports=[*collect_submodules("quantecho.providers"), "keyring.backends.Windows"],
+    hiddenimports=[*collect_submodules("quantecho.providers"), "keyring.backends.Windows", "websocket"],
     # schwab-py is optional (Schwab users run from source); keep the bundle lean
     excludes=["schwab", "numpy", "pandas", "matplotlib", "PIL", "pytest", "IPython"],
     noarchive=False,

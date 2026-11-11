@@ -67,7 +67,7 @@ class TestGuiSmoke(unittest.TestCase):
         # on Python 3.10 each such __del__ makes Tcl wait for the main loop ("main thread is not in main
         # loop"), which can stall the next test's poller for seconds.
         for t in threading.enumerate():
-            if t.name == "quantecho-poller":
+            if t.name in ("quantecho-poller", "quantecho-ticks"):
                 t.join(timeout=5)
         del self.app
         gc.collect()

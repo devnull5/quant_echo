@@ -82,5 +82,6 @@ SPEC = ProviderSpec(
     ),
     notes="Free account works (paper keys are fine). Free = IEX feed; 'sip' needs a paid data plan.",
     min_interval=2,
+    focus_tick_s=1,  # free plan: 200 req/min
     signup_url="https://alpaca.markets",
 )

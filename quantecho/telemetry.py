@@ -24,6 +24,7 @@ class Snapshot:
     signals: List[str] = field(default_factory=list)  # recent signal lines, oldest first
     clipped: int = 0  # bars whose volume was capped as a feed glitch
     market: str = "equity"  # "equity" | "crypto"
+    bars_at_ms: int = 0     # when these bars were fetched (ticks after this are replayed on top)
 
 
 def _fmt(x: Optional[float], nd: int = 2) -> str:
@@ -286,6 +287,7 @@ class TelemetryStore:
         with self._lock:
             s = self._get(symbol.upper())
             s.bars, s.ta, s.clipped = list(bars), ta, clipped
+            s.bars_at_ms = int(time.time() * 1000)
 
     def add_signals(self, symbol: str, lines: List[str], keep: int = 30) -> None:
         with self._lock:
@@ -302,13 +304,30 @@ class TelemetryStore:
         return (max(b.get("high") or b["close"] for b in rth), min(b.get("low") or b["close"] for b in rth))
 
     def chart_data(self, symbol: str) -> tuple:
-        """(bars, in_session flags, latest quote) for the chart; bars are a copy."""
+        """(bars, in_session flags, latest quote, bars_at_ms) for the chart; bars are a copy."""
         with self._lock:
             s = self._snaps.get(symbol.upper())
             bars = list(s.bars) if s else []
             q = s.quote if s else None
+            at = s.bars_at_ms if s else 0
         session = {b["t"] for b in session_bars(bars, self.market)}
-        return bars, [b["t"] in session for b in bars], q
+        return bars, [b["t"] in session for b in bars], q, at
+
+    def update_tick(self, symbol: str, price: float, ts_ms: int, bid=None, ask=None, open_24h=None) -> None:
+        """Fold a real-time tick into the symbol's quote (price, bid/ask, change vs reference)."""
+        from dataclasses import replace
+        with self._lock:
+            s = self._get(symbol.upper())
+            q = s.quote
+            if q is None:
+                s.quote = Quote(symbol.upper(), price, bid, ask, ts_ms, None)
+                return
+            ref = open_24h if open_24h else ((q.last - q.net_change) if q.last is not None and q.net_change is not None
+                                             else None)
+            s.quote = replace(q, last=price, bid=bid if bid is not None else q.bid,
+                              ask=ask if ask is not None else q.ask, timestamp_ms=ts_ms,
+                              net_change=(price - ref) if ref else q.net_change,
+                              net_pct=((price - ref) / ref * 100) if ref else q.net_pct)
 
     def quote(self, symbol: str) -> Optional[Quote]:
         with self._lock:

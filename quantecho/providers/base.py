@@ -58,6 +58,7 @@ class ProviderSpec:
         return int(max(requested, self.min_interval, -(-need // 1)))
     clip_volume_spikes: bool = False  # cap absurd single-bar volume (for feeds known to glitch)
     requires: str = ""               # optional Python package this source needs (hidden if not installed)
+    focus_tick_s: float = 0.0        # extra fast polling of the focus symbol for the live chart (0 = off)
 
     def available(self) -> bool:
         if not self.requires:

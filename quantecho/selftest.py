@@ -57,6 +57,10 @@ def _checks(online: bool) -> List[Tuple[str, Callable[[], str]]]:
             raise RuntimeError("TA not computed")
         return f"VWAP {ta.vwap:.2f} RSI {ta.rsi14:.1f}"
 
+    def websocket_lib():
+        import websocket  # live chart ticks (Coinbase WebSocket)
+        return f"websocket-client {websocket.__version__}"
+
     def https():
         import certifi  # httpx's CA bundle must be bundled for any HTTPS source
         return Path(certifi.where()).name
@@ -73,7 +77,7 @@ def _checks(online: bool) -> List[Tuple[str, Callable[[], str]]]:
         return f"{ver} | {model.name} {model.stat().st_size / 1e9:.2f} GB"
 
     checks = [("time zones", tz), ("Tk", tk_window), ("icon asset", icon), ("keyring", keyring_backend),
-              ("provider registry", providers), ("demo data + TA", demo_pipeline), ("TLS CA bundle", https),
+              ("provider registry", providers), ("demo data + TA", demo_pipeline), ("TLS CA bundle", https), ("WebSocket client", websocket_lib),
               ("built-in AI files (optional)", builtin_ai_files)]
     if "--ai" in sys.argv:
         def builtin_ai_answer():

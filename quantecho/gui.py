@@ -13,7 +13,8 @@ from tkinter import messagebox, ttk
 from typing import Dict, Optional
 
 from . import engine, journal, llm, logsetup
-from .chart import ChartCanvas, merge_live_quote
+from .chart import ChartCanvas, apply_tick
+from .stream import make_stream
 from .logsetup import log as filelog
 from .config import Settings, keyring_available, load_settings, normalize_host, save_settings
 from .poller import Poller
@@ -83,9 +84,17 @@ class App(tk.Tk):
         self.v_ai_status = tk.StringVar(value="")
 
         self._build()
+        # Scrolling over a closed dropdown must NOT change it (it silently switched data sources before)
+        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_class("TCombobox", ev, lambda _e: "break")
         self._render_provider_panel()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._pump_job: Optional[str] = self.after(100, self._pump)
+        self.ticks = None                 # real-time focus tick stream (see stream.py)
+        self._chart_bars: list = []       # telemetry bars + replayed ticks
+        self._chart_sess: list = []
+        self._chart_base_at = -1
+        self._tick_buf: list = []         # recent ticks (price, ts, size) to replay after a bars refresh
+        self._pump_job: Optional[str] = self.after(15, self._pump)
         self.after(300, self.refresh_models)
         if s.ask_source_on_launch or not s.first_run_done:
             self.after(400, self.source_picker)
@@ -210,7 +219,9 @@ class App(tk.Tk):
         rpane.add(self.chart, weight=3)
         rpane.add(log_box, weight=2)
         self._rpane = rpane
-        self.after(250, self._place_chart_sash)
+        self._sash_user = False   # once the user drags the divider, respect their choice
+        rpane.bind("<Configure>", lambda _e: self._place_chart_sash())
+        rpane.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_sash_user", True))
         self.text = tk.Text(log_box, wrap="word", bg=C["sunken"], fg=C["text"], insertbackground=C["text"],
                             relief="flat", font=("Consolas", 10), padx=8, pady=6)
         self.text.tag_configure("q", foreground=C["accent"])
@@ -336,6 +347,8 @@ class App(tk.Tk):
                     self._ai_busy(False)
                 elif kind == "signal":
                     self.log(f"[{self._ts()}] ⚡ {payload.text}", payload.kind if payload.kind != "info" else "muted")
+                elif kind == "tick":
+                    self._on_tick(payload)
                 elif kind == "quotes":
                     self._refresh_table()
                     if self.poller:
@@ -344,7 +357,7 @@ class App(tk.Tk):
                     self._apply_models(payload)
         except queue.Empty:
             pass
-        self._pump_job = self.after(100, self._pump)
+        self._pump_job = self.after(15, self._pump)
 
     def _render_markdown(self, start: str, end: str) -> None:
         """Turn **bold** into a bold tag and '### Heading' into a heading, removing the markers."""
@@ -390,16 +403,48 @@ class App(tk.Tk):
 
     def _place_chart_sash(self) -> None:
         h = self._rpane.winfo_height()
-        if h > 200:
+        if h > 200 and not self._sash_user:
             self._rpane.sashpos(0, int(h * 0.66))  # chart gets ~2/3 of the right side by default
 
     def _refresh_chart(self, focus: str) -> None:
-        bars, sess, q = self.telemetry.chart_data(focus)
+        bars, sess, q, at = self.telemetry.chart_data(focus)
         if not bars:
             return
-        live = merge_live_quote(bars, q.last if q else None, q.timestamp_ms if q else None)
-        sess = sess + [sess[-1]] * (len(live) - len(sess))  # a freshly-started candle inherits its session
-        self.chart.set_data(focus, live, sess)
+        if at != self._chart_base_at or not self._chart_bars:
+            # fresh bars from the poller: rebuild, then replay only ticks that arrived after that fetch
+            self._chart_base_at, self._chart_sess = at, sess
+            live = bars
+            for price, ts, size in self._tick_buf:
+                if ts > at:
+                    live = apply_tick(live, price, ts, size)
+            self._chart_bars = live
+        elif q and q.last is not None and not self.ticks:
+            self._chart_bars = apply_tick(self._chart_bars, q.last, q.timestamp_ms or int(time.time() * 1000))
+        self._push_chart(focus)
+
+    def _push_chart(self, focus: str) -> None:
+        bars = self._chart_bars
+        sess = self._chart_sess + [self._chart_sess[-1] if self._chart_sess else True] * (len(bars) - len(self._chart_sess))
+        self.chart.set_data(focus, bars, sess[:len(bars)])
+
+    def _on_tick(self, t) -> None:
+        if not self.poller or t.symbol != self.poller.focus:
+            return
+        self.telemetry.update_tick(t.symbol, t.price, t.ts_ms, t.bid, t.ask, t.open_24h)
+        self._tick_buf.append((t.price, t.ts_ms, t.size))
+        cutoff = t.ts_ms - 20 * 60_000
+        if self._tick_buf[0][1] < cutoff:
+            self._tick_buf = [x for x in self._tick_buf if x[1] >= cutoff]
+        if self._chart_bars:
+            self._chart_bars = apply_tick(self._chart_bars, t.price, t.ts_ms, t.size)
+            self._push_chart(t.symbol)
+        q = self.telemetry.quote(t.symbol)                  # keep the focus row in the table live too
+        if q and self.tree.exists(t.symbol):
+            vals = list(self.tree.item(t.symbol, "values"))
+            vals[0], vals[1], vals[2] = _f(q.last), _f(q.bid), _f(q.ask)
+            vals[3] = _f(q.net_pct, 2, "%")
+            self.tree.item(t.symbol, values=vals)
+        self.v_status.set(f"{self._status_base} · ⚡ live {time.strftime('%H:%M:%S')}")
 
     # ================================================================ data actions
     def _refresh_provider_list(self) -> None:
@@ -466,11 +511,19 @@ class App(tk.Tk):
         self.poller = Poller(provider, s.symbols.replace(",", " ").split(), s.focus, interval,
                              self.events, self.telemetry, bars_every=max(spec.min_bars_every, interval))
         self.poller.start()
+        self._chart_bars, self._chart_sess, self._chart_base_at, self._tick_buf = [], [], -1, []
+        self.ticks = make_stream(s.provider, provider, s.focus.upper(), self.events, spec.focus_tick_s)
+        if self.ticks:
+            self.ticks.start()
+            filelog.info(f"Real-time ticks for {s.focus}: {type(self.ticks).__name__}")
         filelog.info(f"Start provider={s.provider} focus={s.focus} symbols={s.symbols!r} interval={interval}s")
         self._status_base = f"Live · {spec.label.split(' (')[0]} · {s.focus}"
         self.v_status.set(self._status_base + " · connecting…")
 
     def on_stop(self) -> None:
+        if self.ticks:
+            self.ticks.stop()
+            self.ticks = None
         if self.poller:
             self.poller.stop()
             self.poller = None
