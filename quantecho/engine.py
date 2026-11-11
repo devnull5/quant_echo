@@ -92,6 +92,56 @@ def _no_window() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+# ---------------------------------------------------------------- kill-on-exit (Windows job object)
+
+_JOB = None  # kept open for the app's lifetime; when our process dies, Windows closes it and kills members
+
+
+def _kill_with_parent(proc: subprocess.Popen) -> bool:
+    """Put `proc` in a job object with KILL_ON_JOB_CLOSE, so the engine can't outlive QuantEcho even if
+    the app crashes or is force-killed. Returns False (harmlessly) where unsupported."""
+    global _JOB
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes as w
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = w.HANDLE
+        k32.CreateJobObjectW.argtypes = [w.LPVOID, w.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [w.HANDLE, w.HANDLE]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in ("r_ops", "w_ops", "o_ops", "r_bytes", "w_bytes", "o_bytes")]
+
+        class BASIC(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", w.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", w.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", w.DWORD), ("SchedulingClass", w.DWORD)]
+
+        class EXTENDED(ctypes.Structure):
+            _fields_ = [("Basic", BASIC), ("Io", IO_COUNTERS), ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        if _JOB is None:
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                return False
+            info = EXTENDED()
+            info.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):  # 9 = Extended
+                return False
+            _JOB = job
+        return bool(k32.AssignProcessToJobObject(_JOB, int(proc._handle)))  # type: ignore[attr-defined]
+    except Exception as e:  # never block AI start over this
+        log.warning(f"Could not tie engine lifetime to app: {e}")
+        return False
+
+
 def list_devices(exe: Path) -> List[Device]:
     try:
         r = subprocess.run([str(exe), "--list-devices"], capture_output=True, text=True, timeout=30,
@@ -149,7 +199,8 @@ class Engine:
             if status:
                 status("detecting GPU…")
             devs = list_devices(exe)
-            self.device = pick_device(devs)
+            # QUANTECHO_AI_DEVICE=cpu forces CPU (testing / GPUs that misbehave)
+            self.device = None if os.getenv("QUANTECHO_AI_DEVICE", "").lower() == "cpu" else pick_device(devs)
             self.model, self.port = model, free_port()
             cmd = build_command(exe, model, self.port, self.device)
             log.info(f"Starting built-in AI: {model.name} on "
@@ -158,6 +209,8 @@ class Engine:
                 if (Path.home() / ".quanteco_gpt" / "logs").exists() else subprocess.DEVNULL
             self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=str(exe.parent),
                                          creationflags=_no_window())
+            if not _kill_with_parent(self.proc):
+                log.info("Engine not tied to app lifetime (unsupported); relying on normal shutdown")
             if status:
                 status("loading model…")
             t0 = time.monotonic()

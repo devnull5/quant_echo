@@ -127,6 +127,23 @@ class TestGuiSmoke(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: sum(t.name == "quantecho-poller" and t.is_alive()
                                                   for t in threading.enumerate()) == 1, timeout=5))
 
+    def test_chart_visible_and_draws(self):
+        self.app.on_start_clicked()
+        self.assertTrue(self.wait_for(lambda: len(self.app.chart.bars) > 30), "chart never got bars")
+        self.app.chart.redraw(force=True)
+        self.pump(0.3)
+        self.assert_on_top(self.app.chart, "chart")
+        self.assertGreater(self.app.chart.winfo_height(), 150)
+        rects = [i for i in self.app.chart.find_all() if self.app.chart.type(i) == "rectangle"]
+        self.assertGreater(len(rects), 60)                       # candle bodies + volume bars
+        lines = [i for i in self.app.chart.find_all() if self.app.chart.type(i) == "line"]
+        self.assertGreater(len(lines), 30)                       # wicks + overlays + grid
+        # hover readout appears over a candle
+        c = self.app.chart
+        c.event_generate("<Motion>", x=c.winfo_width() // 2, y=c.winfo_height() // 3)
+        self.pump(0.1)
+        self.assertTrue(c.find_withtag("hover"))
+
     def test_ta_strip_fills(self):
         self.app.on_start_clicked()
         self.assertTrue(self.wait_for(lambda: "VWAP" in self.app.ta_label.cget("text")

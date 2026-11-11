@@ -301,6 +301,15 @@ class TelemetryStore:
             return None, None
         return (max(b.get("high") or b["close"] for b in rth), min(b.get("low") or b["close"] for b in rth))
 
+    def chart_data(self, symbol: str) -> tuple:
+        """(bars, in_session flags, latest quote) for the chart; bars are a copy."""
+        with self._lock:
+            s = self._snaps.get(symbol.upper())
+            bars = list(s.bars) if s else []
+            q = s.quote if s else None
+        session = {b["t"] for b in session_bars(bars, self.market)}
+        return bars, [b["t"] in session for b in bars], q
+
     def quote(self, symbol: str) -> Optional[Quote]:
         with self._lock:
             s = self._snaps.get(symbol.upper())

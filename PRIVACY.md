@@ -12,9 +12,10 @@ you. There are no accounts, analytics, ads or tracking, and the developer receiv
   (for example Coinbase, Alpaca, Twelve Data). They contain the ticker symbols you entered and,
   for sources that need one, **your own API key**. Those providers' own privacy policies and terms
   apply to those requests. QuantEcho's developer has no servers and never sees this traffic.
-- **AI features** talk to **Ollama running on your own computer** (`127.0.0.1` by default). Your
-  questions and market context are not sent to any cloud AI service. If you point the app at an
-  Ollama server elsewhere, requests go to that address.
+- **AI features run on your own computer.** The built-in AI is a local engine that QuantEcho starts
+  on `127.0.0.1` (not reachable from other machines) and stops when the app closes. If you choose the
+  optional Ollama backend, requests go to your Ollama (`127.0.0.1` by default, or the address you set).
+  Your questions and market context are never sent to a cloud AI service.
 - Links you click (for example "get a key ↗") open in your web browser.
 
 ## What the app stores on your computer
@@ -24,7 +25,7 @@ you. There are no accounts, analytics, ads or tracking, and the developer receiv
 | API keys (only if "Remember keys" is ticked) | Windows Credential Manager | Encrypted by Windows; never written to plain files |
 | Settings (source, symbols, model…) | `%USERPROFILE%\.quanteco_gpt\settings.json` | No secrets |
 | AI journal | `%USERPROFILE%\.quanteco_gpt\journal\` | Your questions, answers and the market data shown to the AI |
-| Log file | `%USERPROFILE%\.quanteco_gpt\logs\` | Diagnostics; API keys are redacted |
+| Log files | `%USERPROFILE%\.quanteco_gpt\logs\` | App + AI-engine diagnostics; API keys are redacted |
 
 All of it stays on your computer. Delete the `.quanteco_gpt` folder and the "quantecho" entries in
 Credential Manager to remove everything. Uninstalling the app doesn't delete your journal, so you keep it

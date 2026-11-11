@@ -45,13 +45,7 @@ if (-not $SkipPyInstaller) {
 }
 $dist = Join-Path $Root "build\dist\QuantEcho"
 
-# --- 2. self-test the frozen build before packaging it
-$report = Join-Path $env:TEMP "quantecho_selftest.txt"
-$p = Start-Process -FilePath (Join-Path $dist "QuantEcho.exe") -ArgumentList "--selftest","--out",$report -Wait -PassThru
-Get-Content $report | Write-Host
-if ($p.ExitCode -ne 0) { throw "Frozen self-test failed (see above)" }
-
-# --- 3. layout
+# --- 2. layout (self-test runs on the FINAL layout below, after the AI is copied in)
 $out = Join-Path $Root "build\msix"
 $layout = Join-Path $out "layout"
 if (Test-Path $layout) { Remove-Item $layout -Recurse -Force }
@@ -77,6 +71,16 @@ $lic = Join-Path $app "licenses"; New-Item -ItemType Directory -Force -Path $lic
 Copy-Item (Join-Path $Root "LICENSE") (Join-Path $lic "QuantEcho-LICENSE.txt")
 Copy-Item (Join-Path $Root "THIRD_PARTY_NOTICES.md") $lic
 if (Test-Path (Join-Path $Root "build\licenses")) { Copy-Item (Join-Path $Root "build\licenses\*") $lic }
+
+# --- 3c. self-test exactly what will ship (with a real AI answer unless -NoAI)
+$report = Join-Path $env:TEMP "quantecho_selftest.txt"
+$stArgs = @("--selftest", "--out", $report); if (-not $NoAI) { $stArgs += "--ai" }
+$p = Start-Process -FilePath (Join-Path $app "QuantEcho.exe") -ArgumentList $stArgs -Wait -PassThru
+Get-Content $report | Write-Host
+if ($p.ExitCode -ne 0) { throw "Self-test of the package layout failed (see above)" }
+if (-not $NoAI -and -not (Select-String -Path $report -Pattern "PASS  built-in AI answers" -Quiet)) {
+    throw "Built-in AI did not answer in the packaged layout"
+}
 Get-ChildItem (Join-Path $Root "packaging\assets") -Filter "*.png" |
     Where-Object { $_.Name -notmatch '^(icon-1024|StoreListing)' } |
     Copy-Item -Destination (Join-Path $layout "Assets")

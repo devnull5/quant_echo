@@ -13,6 +13,7 @@ from tkinter import messagebox, ttk
 from typing import Dict, Optional
 
 from . import engine, journal, llm, logsetup
+from .chart import ChartCanvas, merge_live_quote
 from .logsetup import log as filelog
 from .config import Settings, keyring_available, load_settings, normalize_host, save_settings
 from .poller import Poller
@@ -201,7 +202,16 @@ class App(tk.Tk):
         right = ttk.Frame(body)
         self.ta_label = ttk.Label(right, text="Focus: —", style="TA.TLabel")
         self.ta_label.pack(anchor="w", padx=6, pady=(0, 4))
-        self.text = tk.Text(right, wrap="word", bg=C["sunken"], fg=C["text"], insertbackground=C["text"],
+        # chart on top, log below, draggable divider
+        rpane = ttk.PanedWindow(right, orient="vertical")
+        rpane.pack(fill="both", expand=True)
+        self.chart = ChartCanvas(rpane, height=330)
+        log_box = ttk.Frame(rpane)
+        rpane.add(self.chart, weight=3)
+        rpane.add(log_box, weight=2)
+        self._rpane = rpane
+        self.after(250, self._place_chart_sash)
+        self.text = tk.Text(log_box, wrap="word", bg=C["sunken"], fg=C["text"], insertbackground=C["text"],
                             relief="flat", font=("Consolas", 10), padx=8, pady=6)
         self.text.tag_configure("q", foreground=C["accent"])
         self.text.tag_configure("a", foreground="#e3d7a3")
@@ -376,6 +386,20 @@ class App(tk.Tk):
             text=f"{focus}  VWAP {_f(ta.vwap)}{vs}   EMA9 {_f(ta.ema9)}  EMA20 {_f(ta.ema20)}   "
                  f"RSI {_f(ta.rsi14, 1)}   MACD {_f(ta.macd, 3)} / {_f(ta.macd_signal, 3)}  hist {_f(ta.macd_hist, 3)}"
         )
+        self._refresh_chart(focus)
+
+    def _place_chart_sash(self) -> None:
+        h = self._rpane.winfo_height()
+        if h > 200:
+            self._rpane.sashpos(0, int(h * 0.66))  # chart gets ~2/3 of the right side by default
+
+    def _refresh_chart(self, focus: str) -> None:
+        bars, sess, q = self.telemetry.chart_data(focus)
+        if not bars:
+            return
+        live = merge_live_quote(bars, q.last if q else None, q.timestamp_ms if q else None)
+        sess = sess + [sess[-1]] * (len(live) - len(sess))  # a freshly-started candle inherits its session
+        self.chart.set_data(focus, live, sess)
 
     # ================================================================ data actions
     def _refresh_provider_list(self) -> None:
@@ -438,6 +462,7 @@ class App(tk.Tk):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.telemetry = TelemetryStore(market=spec.market, clip_volume=spec.clip_volume_spikes)
+        self.chart.clear("Loading chart…")
         self.poller = Poller(provider, s.symbols.replace(",", " ").split(), s.focus, interval,
                              self.events, self.telemetry, bars_every=max(spec.min_bars_every, interval))
         self.poller.start()

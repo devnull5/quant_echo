@@ -13,7 +13,7 @@
 
 ## Short description (≤ 100 characters)
 
-Live market dashboard with indicators, signals and private on-device AI analysis. Read-only.
+Live charts, buy/sell signal markers and a private AI analyst that runs on your PC. Read-only.
 
 ## Description
 
@@ -23,18 +23,20 @@ intraday indicators, automatic signal alerts and an AI analyst that runs entirel
 • Pick your data source: live crypto from Coinbase with no signup, US stocks with your own free key
   (Alpaca, Twelve Data, Tiingo, Finnhub and more), or an offline demo mode.
 • Watch a full watchlist (SPY and its top 20 holdings by default) with price, bid/ask, day change and volume.
+• Live candlestick chart with VWAP and EMA 9/20 overlays, volume, and buy/sell markers from clear,
+  documented rules (EMA crosses confirmed by VWAP, RSI reversals). Hover any candle for details.
 • Indicators on your focus symbol: VWAP, EMA 9/20, RSI 14, MACD, relative volume, day range.
 • Signal alerts when price crosses VWAP, EMAs cross, RSI goes overbought/oversold, MACD flips or a new
   high/low is set.
 • Ask questions or get a structured analysis (bias, key signals, support/resistance, invalidation, risk)
-  from a local AI model via Ollama. Your data never leaves your computer.
+  from a built-in AI (Qwen3 4B) that runs on your own PC. Nothing to install, no account, and your data
+  never leaves your computer. Fastest with a graphics card; also works on CPU.
 • A daily journal saves every AI analysis with the data it saw.
 • Your API keys are stored securely in Windows Credential Manager.
 
 QuantEcho is read-only: it never places trades or connects to a brokerage account to trade.
 
-AI features are optional and need the free Ollama app (ollama.com) and a model such as qwen3. Everything
-else works without it.
+Power users can switch the AI to Ollama (ollama.com) to use larger models.
 
 Not financial advice. Market data may be delayed or incomplete and AI output can be wrong; you are solely
 responsible for any trading decisions. Each data source has its own terms of use.
@@ -51,7 +53,8 @@ local-AI analysis, journal.
 - Offline demo mode
 - VWAP, EMA, RSI and MACD on any symbol
 - Automatic signal alerts
-- Private on-device AI analysis (Ollama)
+- Live candlestick chart with buy/sell signal markers
+- Built-in private AI analyst (runs on your PC, no setup)
 - Daily analysis journal
 - Keys stored in Windows Credential Manager
 - Read-only, never trades
@@ -64,16 +67,18 @@ stock market, crypto, technical analysis, trading dashboard, VWAP, RSI, AI analy
 ## System requirements / notes
 
 - Windows 10 1809+ or Windows 11, x64. Internet connection for live data.
-- Optional AI: Ollama + a model (qwen3:14b recommended, ~9 GB; a GPU with 12 GB VRAM is ideal,
-  qwen3:8b runs on less).
+- About 3.5 GB disk space (the built-in AI model is ~2.5 GB) and 8 GB RAM.
+- AI is fastest with a graphics card (NVIDIA, AMD or Intel; ~80 tokens/s on an RTX 3060, an analysis in
+  ~15 s). Without one it runs on the CPU (an analysis can take 1-2 minutes).
 
 ## Notes for certification (Partner Center → Submission options)
 
 > QuantEcho is a read-only market dashboard. To test without any account: on launch choose
 > "Coinbase (crypto, no key)" — prices, indicators and signals appear within a few seconds — or
 > "Simulated (offline demo)", which needs no internet. Other sources require the user's own free
-> API key from that provider. AI features are optional and require the separately installed Ollama
-> app; without it the app shows a hint and all other features work. No sign-in, no in-app purchases.
+> API key from that provider. The AI works with no setup: after choosing a source, click
+> "Analyze focus" (the first answer takes a few seconds while the built-in engine starts; on PCs without
+> a graphics card it can take a minute or two). No sign-in, no in-app purchases.
 
 ## Screenshots
 
