@@ -12,7 +12,7 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Dict, Optional
 
-from . import journal, llm, logsetup
+from . import engine, journal, llm, logsetup
 from .logsetup import log as filelog
 from .config import Settings, keyring_available, load_settings, normalize_host, save_settings
 from .poller import Poller
@@ -63,6 +63,7 @@ class App(tk.Tk):
         self.v_focus = tk.StringVar(value=s.focus)
         self.v_interval = tk.StringVar(value=str(s.interval))
         self.v_model = tk.StringVar(value=s.model)
+        self.v_backend = tk.StringVar(value="Built-in" if s.ai_backend == "builtin" else "Ollama")
         self.v_host = tk.StringVar(value=s.ollama_host)
         self.v_remember = tk.BooleanVar(value=s.remember)
         self.v_show_personal = tk.BooleanVar(value=s.show_personal_sources)
@@ -153,8 +154,12 @@ class App(tk.Tk):
         self.provider_frame.pack(fill="x")
         ai_row = ttk.Frame(sf)
         ai_row.pack(fill="x", pady=(8, 0))
-        ttk.Label(ai_row, text="Local AI (Ollama)", style="H.TLabel").pack(side="left", padx=(10, 6))
-        self._entry(ai_row, "Host", self.v_host, 24)
+        ttk.Label(ai_row, text="Local AI", style="H.TLabel").pack(side="left", padx=(10, 6))
+        cb_be = ttk.Combobox(ai_row, textvariable=self.v_backend, values=["Built-in", "Ollama"],
+                             state="readonly", width=9)
+        cb_be.pack(side="left")
+        cb_be.bind("<<ComboboxSelected>>", lambda _e: (self.on_save(), self.refresh_models()))
+        self._entry(ai_row, "Ollama host", self.v_host, 22)
         ttk.Label(ai_row, text="Model", style="Muted.TLabel").pack(side="left", padx=(10, 4))
         self.cb_model = ttk.Combobox(ai_row, textvariable=self.v_model, width=22)
         self.cb_model.pack(side="left")
@@ -284,6 +289,7 @@ class App(tk.Tk):
             interval=interval,
             model=self.v_model.get().strip() or llm.DEFAULT_MODEL,
             ollama_host=normalize_host(self.v_host.get()),
+            ai_backend="builtin" if self.v_backend.get() == "Built-in" else "ollama",
             remember=bool(self.v_remember.get()),
             show_personal_sources=bool(self.v_show_personal.get()),
             first_run_done=True,
@@ -308,6 +314,8 @@ class App(tk.Tk):
                 elif kind == "ai_tok":
                     self.text.insert("ai", payload, "a")
                     self.text.see("ai")
+                elif kind == "ai_status":
+                    self.v_ai_live.set(payload)
                 elif kind == "ai_think":
                     self.v_ai_live.set(f"thinking… ~{payload // 4} tok")
                 elif kind == "ai_done":
@@ -453,6 +461,13 @@ class App(tk.Tk):
 
     # ================================================================ AI actions
     def refresh_models(self) -> None:
+        if self.v_backend.get() == "Built-in":
+            if engine.available():
+                self.v_ai_status.set(f"● Built-in AI: {engine.find_model().stem} (Qwen3, Apache-2.0) · "
+                                     "starts on your first question")
+            else:
+                self.v_ai_status.set("⚠ Built-in AI isn't included in this build. Choose Ollama.")
+            return
         host = normalize_host(self.v_host.get())
         self.v_ai_status.set("checking…")
         threading.Thread(target=lambda: self.events.put(("models", llm.list_models(host))), daemon=True).start()
@@ -482,7 +497,8 @@ class App(tk.Tk):
         think = bool(self.v_think.get()) if think is None else think
         self._ai_busy(True)
         self.v_ai_live.set("loading model…")
-        self.events.put(("ai_start", f"[{self._ts()}] A ({s.model}{', deep think' if think else ''})>"))
+        who = "built-in AI" if s.ai_backend == "builtin" else s.model
+        self.events.put(("ai_start", f"[{self._ts()}] A ({who}{', deep think' if think else ''})>"))
 
         def worker():
             t0 = time.monotonic()
@@ -494,17 +510,24 @@ class App(tk.Tk):
                     self.events.put(("ai_tok", "\n"))
                 self.events.put(("ai_tok", t))
 
-            text, st = llm.ask_stream(prompt, tok, model=s.model, host=s.ollama_host, think=think,
+            if s.ai_backend == "builtin":
+                text, st = llm.ask_stream_builtin(
+                    prompt, tok, think=think, on_thinking=lambda n: self.events.put(("ai_think", n)),
+                    on_status=lambda m: self.events.put(("ai_status", m)))
+                s.model = st.model
+            else:
+                text, st = llm.ask_stream(prompt, tok, model=s.model, host=s.ollama_host, think=think,
                                       on_thinking=lambda n: self.events.put(("ai_think", n)))
             if first[0]:  # nothing streamed -> error/empty message
                 self.events.put(("ai_tok", " " + text))
             speed = f", {st.tok_per_s:.0f} tok/s" if st.tok_per_s else ""
-            if text.startswith("[Ollama"):
+            failed = text.startswith(("[Ollama", "[Built-in AI"))
+            if failed:
                 filelog.warning(f"AI failed ({s.model}): {text}")
             else:
                 filelog.info(f"AI ok {title!r} model={s.model} {time.monotonic() - t0:.0f}s {st.tok_per_s:.0f} tok/s")
             note = ""
-            if not text.startswith("[Ollama"):
+            if not failed:
                 try:
                     journal.append(f"{title} · {s.model}", text, context=ctx)
                     note = " · journaled"
@@ -707,6 +730,7 @@ class App(tk.Tk):
 
     def _on_close(self) -> None:
         self.on_stop()
+        engine.ENGINE.stop()  # shut down the bundled AI server, if it was started
         for job in (getattr(self, "_pump_job", None), getattr(self, "_auto_job", None)):
             if job:
                 try:

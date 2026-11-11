@@ -192,3 +192,80 @@ def list_models(host: str = DEFAULT_HOST, timeout: float = 3) -> List[str]:
         return sorted(m["name"] for m in data.get("models", []) if m.get("name"))
     except (urllib.error.URLError, TimeoutError, ValueError, OSError, KeyError):
         return []
+
+
+# ================================================================ built-in engine (llama.cpp server)
+
+def build_openai_request(prompt: str, *, think: bool = False, max_tokens: Optional[int] = None) -> Dict[str, Any]:
+    return {
+        "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
+        "stream": True,
+        "max_tokens": max_tokens or (4096 if think else 1024),
+        "temperature": 0.6 if think else 0.3,
+        "chat_template_kwargs": {"enable_thinking": bool(think)},  # Qwen3 thinking switch
+        "timings_per_token": False,
+    }
+
+
+def parse_sse_line(raw: bytes) -> Optional[Dict[str, Any]]:
+    """One 'data: {...}' server-sent-event line -> dict; None for keep-alives / [DONE]."""
+    line = raw.decode("utf-8", errors="replace").strip()
+    if not line.startswith("data:"):
+        return None
+    payload = line[5:].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    return json.loads(payload)
+
+
+def _builtin_url_open(base: str, body: Dict[str, Any], timeout: float):
+    req = urllib.request.Request(f"{base}/v1/chat/completions", data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "Accept": "text/event-stream"})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def ask_stream_builtin(prompt: str, on_token: Callable[[str], None], *, think: bool = False,
+                       on_thinking: Optional[Callable[[int], None]] = None,
+                       on_status: Optional[Callable[[str], None]] = None, timeout: float = 600) -> tuple:
+    """Stream from QuantEcho's bundled engine (starting it if needed). Same contract as ask_stream."""
+    from .engine import ENGINE
+
+    stats = Stats(model="built-in")
+    try:
+        base = ENGINE.ensure_running(status=on_status)
+    except RuntimeError as e:
+        return f"[Built-in AI] {e}", stats
+    stats.model = ENGINE.describe()
+    out: List[str] = []
+    thinking_chars = 0
+    try:
+        with _builtin_url_open(base, build_openai_request(prompt, think=think), timeout) as r:
+            for raw in r:
+                chunk = parse_sse_line(raw)
+                if not chunk:
+                    continue
+                if chunk.get("error"):
+                    raise ValueError(chunk["error"].get("message") if isinstance(chunk["error"], dict) else chunk["error"])
+                for ch in chunk.get("choices") or []:
+                    delta = ch.get("delta") or {}
+                    rc = delta.get("reasoning_content") or ""
+                    if rc:
+                        thinking_chars += len(rc)
+                        if on_thinking:
+                            on_thinking(thinking_chars)
+                    text = delta.get("content") or ""
+                    if text:
+                        if not out:
+                            text = text.lstrip()
+                        if text:
+                            out.append(text)
+                            on_token(text)
+                t = chunk.get("timings") or {}
+                if t.get("predicted_per_second"):
+                    stats.tok_per_s = float(t["predicted_per_second"])
+                    stats.eval_tokens = int(t.get("predicted_n") or 0)
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
+        return f"[Built-in AI] {type(e).__name__}: {e}", stats
+    stats.think_tokens = thinking_chars // 4
+    text = _THINK.sub("", "".join(out)).strip()
+    return (text or "(no answer)"), stats

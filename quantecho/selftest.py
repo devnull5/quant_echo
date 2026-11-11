@@ -61,8 +61,32 @@ def _checks(online: bool) -> List[Tuple[str, Callable[[], str]]]:
         import certifi  # httpx's CA bundle must be bundled for any HTTPS source
         return Path(certifi.where()).name
 
+    def builtin_ai_files():
+        from . import engine
+        exe, model = engine.find_engine(), engine.find_model()
+        if not exe or not model:
+            raise FileNotFoundError(f"engine={exe} model={model}")
+        import subprocess
+        v = subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        ver = (v.stdout + v.stderr).strip().splitlines()[0]
+        return f"{ver} | {model.name} {model.stat().st_size / 1e9:.2f} GB"
+
     checks = [("time zones", tz), ("Tk", tk_window), ("icon asset", icon), ("keyring", keyring_backend),
-              ("provider registry", providers), ("demo data + TA", demo_pipeline), ("TLS CA bundle", https)]
+              ("provider registry", providers), ("demo data + TA", demo_pipeline), ("TLS CA bundle", https),
+              ("built-in AI files (optional)", builtin_ai_files)]
+    if "--ai" in sys.argv:
+        def builtin_ai_answer():
+            from . import llm
+            from .engine import ENGINE
+            try:
+                text, st = llm.ask_stream_builtin("Reply with exactly the word: ready", lambda t: None)
+            finally:
+                ENGINE.stop()
+            if "ready" not in text.lower():
+                raise RuntimeError(text[:200])
+            return f"{st.model} -> {text!r}"
+        checks.append(("built-in AI answers", builtin_ai_answer))
     if online:
         def coinbase():
             from .providers import create

@@ -15,7 +15,8 @@ param(
     [string]$Publisher = "CN=QuantEcho Dev",
     [string]$PublisherDisplayName = "QuantEcho (dev build)",
     [string]$Version = "",
-    [switch]$SkipPyInstaller
+    [switch]$SkipPyInstaller,
+    [switch]$NoAI          # build without the bundled engine + model (small package; Ollama only)
 )
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
@@ -56,6 +57,26 @@ $layout = Join-Path $out "layout"
 if (Test-Path $layout) { Remove-Item $layout -Recurse -Force }
 New-Item -ItemType Directory -Force -Path (Join-Path $layout "Assets") | Out-Null
 Copy-Item $dist (Join-Path $layout "QuantEcho") -Recurse
+$app = Join-Path $layout "QuantEcho"
+
+# --- 3b. built-in AI: llama.cpp server (+ its libraries only) and the Qwen3 model, next to QuantEcho.exe
+if (-not $NoAI) {
+    & $Py (Join-Path $Root "packaging\fetch_ai.py")
+    if ($LASTEXITCODE) { throw "fetch_ai.py failed" }
+    $eng = Join-Path $app "engine"; New-Item -ItemType Directory -Force -Path $eng | Out-Null
+    Copy-Item (Join-Path $Root "build\engine\llama-server.exe") $eng
+    Get-ChildItem (Join-Path $Root "build\engine") -Filter "*.dll" |
+        Where-Object { $_.Name -notmatch '-impl\.dll$' -or $_.Name -eq 'llama-server-impl.dll' } |
+        Copy-Item -Destination $eng
+    $mdl = Join-Path $app "models"; New-Item -ItemType Directory -Force -Path $mdl | Out-Null
+    Copy-Item (Join-Path $Root "build\models\*.gguf") $mdl
+    Write-Host ("built-in AI: engine {0:N0} MB + model {1:N0} MB" -f `
+        ((Get-ChildItem $eng | Measure-Object Length -Sum).Sum / 1MB), ((Get-ChildItem $mdl | Measure-Object Length -Sum).Sum / 1MB))
+}
+$lic = Join-Path $app "licenses"; New-Item -ItemType Directory -Force -Path $lic | Out-Null
+Copy-Item (Join-Path $Root "LICENSE") (Join-Path $lic "QuantEcho-LICENSE.txt")
+Copy-Item (Join-Path $Root "THIRD_PARTY_NOTICES.md") $lic
+if (Test-Path (Join-Path $Root "build\licenses")) { Copy-Item (Join-Path $Root "build\licenses\*") $lic }
 Get-ChildItem (Join-Path $Root "packaging\assets") -Filter "*.png" |
     Where-Object { $_.Name -notmatch '^(icon-1024|StoreListing)' } |
     Copy-Item -Destination (Join-Path $layout "Assets")

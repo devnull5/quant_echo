@@ -40,12 +40,14 @@ class TestGuiSmoke(unittest.TestCase):
 
         self.gui = gui
         s = cfg.Settings(provider="simulated", symbols="SPY AAPL NVDA MSFT AMZN", focus="SPY",
-                         interval=1, first_run_done=True, ask_source_on_launch=False)
+                         interval=1, first_run_done=True, ask_source_on_launch=False, ai_backend="ollama")
         self.patches = [
             mock.patch.object(gui, "load_settings", return_value=s),
             mock.patch.object(gui, "save_settings", return_value=[]),
             mock.patch.object(gui.llm, "preload"),
             mock.patch.object(gui.llm, "list_models", return_value=[]),
+            mock.patch.object(gui.engine.ENGINE, "ensure_running",   # never start a real AI server in tests
+                              side_effect=RuntimeError("engine disabled in tests")),
         ]
         for p in self.patches:
             p.start()
@@ -164,6 +166,39 @@ class TestGuiSmoke(unittest.TestCase):
         self.assertIn("Bias: neutral", body)
         self.assertNotIn("**", body)
         self.assertRegex(body, r"tok/s[^\n]*\)\n\n")  # blank line after the answer footer
+
+
+@unittest.skipUnless(HAVE_DISPLAY, "no display available for Tk")
+class TestGuiBuiltinAI(TestGuiSmoke):
+    """Same window, but the AI backend is the bundled engine (faked)."""
+
+    def test_builtin_backend_is_used_and_reports_status(self):
+        from quantecho import llm
+        self.app.v_backend.set("Built-in")
+        calls = []
+
+        def fake_builtin(prompt, on_token, **kw):
+            calls.append(kw)
+            kw["on_status"]("loading model…")
+            on_token("**Bias:** bullish")
+            return "x", llm.Stats(model="Qwen3-4B-Q4_K_M · test GPU", tok_per_s=55)
+        with mock.patch.object(self.gui.llm, "ask_stream_builtin", fake_builtin),                 mock.patch.object(self.gui.llm, "ask_stream", side_effect=AssertionError("Ollama used")),                 mock.patch.object(self.gui.journal, "append"):
+            self.app.v_with_ctx.set(False)
+            self.app.on_ask()
+            self.assertTrue(self.wait_for(lambda: "tok/s" in self.app.text.get("1.0", "end")))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("built-in AI", self.app.text.get("1.0", "end"))
+        self.assertIn("55 tok/s", self.app.text.get("1.0", "end"))
+
+    def test_builtin_failure_is_reported_not_crashing(self):
+        self.app.v_backend.set("Built-in")
+        with mock.patch.object(self.gui.journal, "append") as j:
+            self.app.v_with_ctx.set(False)
+            self.app.on_ask()
+            self.assertTrue(self.wait_for(lambda: "Built-in AI" in self.app.text.get("1.0", "end")))
+            self.pump(0.3)
+            j.assert_not_called()                                  # errors aren't journaled
+        self.assertEqual(str(self.app.btn_ask.cget("state")), "normal")  # buttons re-enabled
 
 
 if __name__ == "__main__":

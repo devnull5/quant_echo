@@ -38,6 +38,7 @@ class Settings:
     show_personal_sources: bool = False  # list Yahoo etc. (unofficial / personal-use-only terms)
     first_run_done: bool = False
     ask_source_on_launch: bool = True  # show the source picker every launch (has a "don't ask again" box)
+    ai_backend: str = "builtin"        # "builtin" (bundled llama.cpp + Qwen3 4B) or "ollama"
     creds: Dict[str, str] = field(default_factory=dict)
 
 
@@ -48,6 +49,7 @@ _ENV = {
     "interval": "INTERVAL",
     "model": "OLLAMA_MODEL",
     "ollama_host": "OLLAMA_HOST",
+    "ai_backend": "AI_BACKEND",
 }
 
 
@@ -99,6 +101,10 @@ def load_settings(path: Path = SETTINGS_PATH) -> Settings:
     if (saved and "first_run_done" not in saved) or (not saved and os.getenv("DATA_PROVIDER")):
         s.first_run_done = True  # existing user (older settings file) or configured via .env: no picker
     s.ollama_host = normalize_host(s.ollama_host)
+    if s.ai_backend not in ("builtin", "ollama"):
+        s.ai_backend = "builtin"
+    if saved and "ai_backend" not in saved and not os.getenv("AI_BACKEND"):
+        s.ai_backend = "ollama"  # existing users keep the Ollama setup they already have
 
     saved_creds = saved.get("creds") if isinstance(saved.get("creds"), dict) else {}
     for f in all_fields():
