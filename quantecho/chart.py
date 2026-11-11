@@ -208,6 +208,15 @@ class ChartCanvas(tk.Canvas):
         self.bind("<B1-Motion>", self._drag_move)
         self.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_drag", None))
         self.bind("<Double-Button-1>", lambda _e: self.go_live())
+        self.bind("<Destroy>", self._on_destroy)
+
+    def _on_destroy(self, e) -> None:
+        if e.widget is self and self._pending:      # don't leave a scheduled redraw behind a dead widget
+            try:
+                self.after_cancel(self._pending)
+            except tk.TclError:
+                pass
+            self._pending = None
 
     # -------------------------------------------------- data
     def set_data(self, symbol: str, bars: List[Dict[str, Any]], in_session: Optional[List[bool]] = None) -> None:

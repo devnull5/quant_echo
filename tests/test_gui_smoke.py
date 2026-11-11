@@ -112,7 +112,9 @@ class TestGuiSmoke(unittest.TestCase):
         first = self.app.tree.item(self.app.tree.get_children()[0])
         self.assertEqual(first["text"], "SPY")
         self.assertNotEqual(first["values"][0], "—")  # has a price
-        self.assertTrue(self.wait_for(lambda: "updated" in self.app.v_status.get()), "status never updated")
+        # heartbeat is either "updated hh:mm:ss" (poll) or "⚡ live hh:mm:ss" (real-time ticks), whichever came last
+        self.assertTrue(self.wait_for(lambda: any(w in self.app.v_status.get() for w in ("updated", "live "))),
+                        "status never updated")
 
     def test_start_twice_restarts_cleanly(self):
         self.app.on_start_clicked()
