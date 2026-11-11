@@ -14,6 +14,9 @@ from typing import Dict, Optional
 
 from . import engine, journal, llm, logsetup
 from .chart import ChartCanvas, apply_tick
+from .confluence import FLAT, UP, ConfluenceRule, evaluate, signals_on_target, summary
+from .confluence_feed import ConfluenceFeed
+from .telemetry import is_rth
 from .stream import make_stream
 from .logsetup import log as filelog
 from .config import Settings, keyring_available, load_settings, normalize_host, save_settings
@@ -105,6 +108,7 @@ class App(tk.Tk):
         self._chart_base_at = -1
         self._tick_buf: list = []         # recent ticks (price, ts, size) to replay after a bars refresh
         self._pump_job: Optional[str] = self.after(15, self._pump)
+        self.after(50, self._apply_chart_view)
         self.after(300, self.refresh_models)
         if s.ask_source_on_launch or not s.first_run_done:
             self.after(400, self.source_picker)
@@ -221,14 +225,38 @@ class App(tk.Tk):
         body.add(left, weight=2)
 
         right = ttk.Frame(body)
-        self.ta_label = ttk.Label(right, text="Focus: —", style="TA.TLabel")
-        self.ta_label.pack(anchor="w", padx=6, pady=(0, 4))
+        ta_row = ttk.Frame(right)
+        ta_row.pack(fill="x", pady=(0, 4))
+        self.ta_label = ttk.Label(ta_row, text="Focus: —", style="TA.TLabel")
+        self.ta_label.pack(side="left", padx=6)
+        self.v_view = tk.StringVar(value=self.settings.chart_view)
+        for val, txt in (("confluence", "NVDA confluence (6 charts)"), ("focus", "Focus chart")):
+            ttk.Radiobutton(ta_row, text=txt, value=val, variable=self.v_view,
+                            command=self._apply_chart_view).pack(side="right", padx=4)
         # chart on top, log below, draggable divider
         rpane = ttk.PanedWindow(right, orient="vertical")
         rpane.pack(fill="both", expand=True)
-        self.chart = ChartCanvas(rpane, height=330)
+        chart_holder = ttk.Frame(rpane)
+        self.chart = ChartCanvas(chart_holder, height=330)
+        self.grid_box = ttk.Frame(chart_holder)
+        self.v_confl = tk.StringVar(value="Confluence: start a STOCK data source (e.g. Yahoo, Alpaca, Simulated)")
+        ttk.Label(self.grid_box, textvariable=self.v_confl, style="TA.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 2))
+        self.confl_rule = ConfluenceRule()
+        self.tiles = {}
+        for k, leg in enumerate(self.confl_rule.legs):
+            tile = ChartCanvas(self.grid_box, bars_shown=60, compact=True, height=150, width=200)
+            tile.grid(row=1 + k // 3, column=k % 3, sticky="nsew", padx=1, pady=1)
+            self.tiles[leg.name] = tile
+        for c in range(3):
+            self.grid_box.columnconfigure(c, weight=1, uniform="tiles")
+        for r in (1, 2):
+            self.grid_box.rowconfigure(r, weight=1, uniform="tiles")
+        self.confl_feed = None
+        self._confl_seen: set = set()
+        self._confl_loaded = False
         log_box = ttk.Frame(rpane)
-        rpane.add(self.chart, weight=3)
+        rpane.add(chart_holder, weight=3)
         rpane.add(log_box, weight=2)
         self._rpane = rpane
         self._sash_user = False   # once the user drags the divider, respect their choice
@@ -361,6 +389,8 @@ class App(tk.Tk):
                     self.log(f"[{self._ts()}] ⚡ {payload.text}", payload.kind if payload.kind != "info" else "muted")
                 elif kind in ("bot", "bot_status", "bot_confirm"):
                     self._bot_event(kind, payload)
+                elif kind == "confl_data":
+                    self._on_confl_data(payload)
                 elif kind == "tick":
                     self._on_tick(payload)
                 elif kind == "quotes":
@@ -530,11 +560,90 @@ class App(tk.Tk):
         if self.ticks:
             self.ticks.start()
             filelog.info(f"Real-time ticks for {s.focus}: {type(self.ticks).__name__}")
+        self._start_confluence()
         filelog.info(f"Start provider={s.provider} focus={s.focus} symbols={s.symbols!r} interval={interval}s")
         self._status_base = f"Live · {spec.label.split(' (')[0]} · {s.focus}"
         self.v_status.set(self._status_base + " · connecting…")
 
+    # ---------- NVDA confluence grid
+    def _apply_chart_view(self) -> None:
+        view = self.v_view.get()
+        if view == "confluence":
+            self.chart.pack_forget()
+            self.grid_box.pack(fill="both", expand=True)
+            self._start_confluence()
+        else:
+            self.grid_box.pack_forget()
+            self.chart.pack(fill="both", expand=True)
+            self._stop_confluence()
+        if self.settings.chart_view != view:
+            self.settings.chart_view = view
+            try:
+                save_settings(self._collect())
+            except OSError:
+                pass
+
+    def _start_confluence(self) -> None:
+        if self.v_view.get() != "confluence" or not self.poller or self.confl_feed:
+            return
+        s = self._collect()
+        spec = PROVIDERS[s.provider]
+        if spec.market != "equity":
+            self.v_confl.set(f"Confluence needs a STOCK data source; {spec.label} is crypto.")
+            return
+        try:
+            provider = create(s.provider, s.creds)
+        except Exception as e:
+            self.v_confl.set(f"Confluence feed unavailable: {e}")
+            return
+        for leg in self.confl_rule.legs:
+            self.tiles[leg.name].clear(f"Loading {leg.label}…")
+        self._confl_seen, self._confl_loaded = set(), False
+        self.confl_feed = ConfluenceFeed(provider, self.confl_rule.symbols, self.events)
+        self.confl_feed.start()
+        self.v_confl.set("Confluence: loading 6 instruments…")
+
+    def _stop_confluence(self) -> None:
+        if self.confl_feed:
+            self.confl_feed.stop()
+            self.confl_feed = None
+
+    def _on_confl_data(self, data) -> None:
+        if not self.confl_feed:
+            return
+        rule = self.confl_rule
+        st = evaluate(data, rule)
+        cur = st.latest()
+        colors = {UP: "#3fb950", -1: "#f85149", FLAT: "#9aa9bf"}
+        for leg in rule.legs:
+            bars = data.get(leg.symbol) or []
+            if not bars:
+                continue
+            d = cur.get(leg.name, FLAT)
+            arrow = "▲" if d == UP else "▼" if d == -1 else "–"
+            sigs = signals_on_target(st, bars) if leg.name == rule.target else []
+            self.tiles[leg.name].set_data(leg.symbol, bars, [is_rth(b["t"]) for b in bars], signals=sigs,
+                                          title=f"{leg.label} {arrow}", title_color=colors[d])
+        last = st.signals[-1] if st.signals else None
+        when = ""
+        if last:
+            from datetime import datetime, timezone
+            when = datetime.fromtimestamp(st.timeline[last.i] / 1000, tz=timezone.utc).astimezone().strftime("%H:%M")
+        self.v_confl.set(f"{rule.target} confluence ({rule.lookback}m):  {summary(st, rule)}"
+                         + (f"   ·   last: {last.side.upper()} {when}" if last else "   ·   no signal yet today"))
+        first_load = not self._confl_loaded and bool(st.timeline)
+        for sg in st.signals:                          # announce each NEW signal exactly once
+            t = st.timeline[sg.i]
+            if t in self._confl_seen:
+                continue
+            self._confl_seen.add(t)
+            if not first_load:                         # today's earlier signals are shown on the chart, not alerted
+                self.log(f"[{self._ts()}] ⚡ {rule.target} {sg.reason}", "bull" if sg.side == "buy" else "bear")
+        if st.timeline:
+            self._confl_loaded = True
+
     def on_stop(self) -> None:
+        self._stop_confluence()
         if self.ticks:
             self.ticks.stop()
             self.ticks = None

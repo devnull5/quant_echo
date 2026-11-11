@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from ..chart import Signal, compute_series, find_signals
+from ..confluence import ConfluenceRule, evaluate
 from ..logsetup import log
 from ..telemetry import is_rth
 from .broker import Broker
@@ -92,6 +93,8 @@ class TradingBot:
         self._bars_at: Dict[str, float] = {}
         self._seen_signal_t: Dict[str, int] = {}
         self._last_sig: Dict[str, Optional[Signal]] = {}
+        self.rule = ConfluenceRule()
+        self._confl_seen_t: Optional[int] = None
         self._stop = threading.Event()
         self._kill = threading.Event()
         self._lock = threading.RLock()
@@ -143,6 +146,24 @@ class TradingBot:
                 break
         return None
 
+    def _new_confluence_signal(self) -> Optional[Signal]:
+        """Confluence signal on the minute that JUST closed (all legs aligned), reported once."""
+        series = {}
+        for s in self.rule.symbols:
+            try:
+                series[s] = self._refresh(s)
+            except Exception as e:
+                self.journal("data_error", symbol=s, error=f"{type(e).__name__}: {e}")
+                return None
+        st = evaluate(series, self.rule)
+        if not st.signals or st.signals[-1].i != len(st.timeline) - 1:
+            return None
+        t = st.timeline[-1]
+        if t == self._confl_seen_t:
+            return None
+        self._confl_seen_t = t
+        return st.signals[-1]
+
     # ---------------------------------------------------------------- main step
     def step(self) -> None:
         with self._lock:
@@ -152,6 +173,8 @@ class TradingBot:
                 self._kill_all()
                 return
             self._manage_pending(now)
+            confl = self.params.signal_source == "confluence"
+            confl_sig = self._new_confluence_signal() if confl else None
             for sym in self.limits.allowed_symbols:
                 try:
                     bars = self._refresh(sym)
@@ -161,7 +184,10 @@ class TradingBot:
                 if not bars:
                     continue
                 spot = bars[-1]["close"]
-                sig = self._new_signal(sym, bars)
+                if confl:
+                    sig = confl_sig if sym == self.rule.target else None   # only the target trades
+                else:
+                    sig = self._new_signal(sym, bars)
                 if sig:
                     self._last_sig[sym] = sig
                     self.journal("signal", symbol=sym, side=sig.side, kind=sig.kind, reason=sig.reason, spot=spot)

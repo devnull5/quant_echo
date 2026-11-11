@@ -219,7 +219,7 @@ def rth_bars(closes, day=date(2026, 11, 11)):
 
 class FakeData:
     def __init__(self, bars):
-        self.bars = {"SPY": bars, "NVDA": []}
+        self.bars = {"SPY": bars, "NVDA": []} if isinstance(bars, list) else dict(bars)
 
     def get_session_minute_bars(self, sym):
         return list(self.bars.get(sym, []))
@@ -303,6 +303,37 @@ class TestBotEndToEnd(unittest.TestCase):
         bot = self.make()
         bot.step()
         self.assertEqual((len(bot.pending), len(bot.positions)), (0, 0))
+
+
+class TestBotConfluence(unittest.TestCase):
+    def test_confluence_buys_nvda_call_only(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        from test_confluence import scenario
+        from quantecho.confluence import ConfluenceRule, evaluate
+        from quantecho.trading.bot import TradingBot
+        full = scenario()
+        st = evaluate(full, ConfluenceRule())
+        buy = next(s for s in st.signals if s.side == "buy")
+        cut = st.timeline[buy.i + 1]                     # keep one forming bar after the signal bar
+        data = FakeData({})
+        data.bars = {sym: [b for b in bars if b["t"] <= cut] for sym, bars in full.items()}
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            bot = TradingBot(SimBroker(), data, RiskLimits(allowed_symbols=["SPY", "NVDA"], max_premium_per_trade=1500),
+                             StrategyParams(signal_source="confluence"), queue.Queue(), journal_dir=Path(tmp.name),
+                             clock=lambda: datetime(2026, 11, 11, 11, 0, tzinfo=NY), bars_every_s=0)
+            bot.step()
+            bot.step()
+            self.assertIn("NVDA", bot.positions)
+            self.assertTrue(bot.positions["NVDA"].contract.is_call)
+            self.assertNotIn("SPY", bot.positions)        # only the confluence target trades
+            log = (Path(tmp.name) / "2026-11-11.jsonl").read_text(encoding="utf-8")
+            self.assertIn("confluence", log)
+            bot.step()
+            self.assertEqual(bot.state.entries, 1)        # same confluence signal never trades twice
+        finally:
+            tmp.cleanup()
 
 
 if __name__ == "__main__":

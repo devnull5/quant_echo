@@ -23,6 +23,7 @@ NY = ZoneInfo("America/New_York")
 
 @dataclass
 class StrategyParams:
+    signal_source: str = "trend"          # "trend" (per-symbol chart signals) or "confluence" (NVDA intermarket)
     use_reversal_signals: bool = False   # trend signals only by default (reversals are noisier)
     target_dte: int = 7
     min_dte: int = 2
@@ -40,7 +41,7 @@ class StrategyParams:
 
 def entry_side(sig: Signal, p: StrategyParams) -> Optional[str]:
     """'C' for a bullish entry, 'P' for bearish, None if the signal shouldn't trade."""
-    if sig.kind != "trend" and not p.use_reversal_signals:
+    if sig.kind == "reversal" and not p.use_reversal_signals:
         return None
     return "C" if sig.side == "buy" else "P"
 
@@ -81,7 +82,7 @@ def exit_reason(entry_price: float, mark: float, contract: OptionContract, opene
             return f"take profit ({chg:+.0%})"
         if chg <= -p.stop_loss_pct:
             return f"stop loss ({chg:+.0%})"
-    if p.exit_on_opposite_signal and last_signal is not None and last_signal.kind == "trend":
+    if p.exit_on_opposite_signal and last_signal is not None and last_signal.kind in ("trend", "confluence"):
         against = (contract.is_call and last_signal.side == "sell") or (not contract.is_call and last_signal.side == "buy")
         if against:
             return f"opposite signal ({last_signal.reason})"

@@ -62,6 +62,7 @@ class TradingPanel(tk.Toplevel):
             "sl": tk.StringVar(value=str(int(t.get("sl", P.stop_loss_pct * 100)))),
             "opp_exit": tk.BooleanVar(value=bool(t.get("opp_exit", P.exit_on_opposite_signal))),
             "reversals": tk.BooleanVar(value=bool(t.get("reversals", P.use_reversal_signals))),
+            "signal_source": tk.StringVar(value=t.get("signal_source", "Trend (per symbol)")),
         }
         self.v_secret = {k: tk.StringVar(value=secret_get(k) or "") for pair in SECRETS.values() for k in pair}
         self.v_status = tk.StringVar(value="Bot stopped")
@@ -135,6 +136,12 @@ class TradingPanel(tk.Toplevel):
         self._row(s2, "Stop %", self.v["sl"], 4)
         ttk.Checkbutton(s2, text="Exit on opposite signal", variable=self.v["opp_exit"]).pack(side="left", padx=6)
         ttk.Checkbutton(s2, text="+ reversals", variable=self.v["reversals"]).pack(side="left")
+        s3 = ttk.Frame(strat)
+        s3.pack(fill="x")
+        ttk.Label(s3, text="Signal source", style="Muted.TLabel").pack(side="left", padx=(8, 3))
+        ttk.Combobox(s3, textvariable=self.v["signal_source"], state="readonly", width=34,
+                     values=["Trend (per symbol)",
+                             "NVDA confluence (NVDA+SPY+QQQ+YM, DXY/TNX not against)"]).pack(side="left")
 
         st = ttk.Frame(self, padding=(8, 6))
         st.pack(fill="x")
@@ -177,9 +184,13 @@ class TradingPanel(tk.Toplevel):
                            take_profit_pct=self._num("tp", float, 1, 1000) / 100,
                            stop_loss_pct=self._num("sl", float, 1, 100) / 100,
                            exit_on_opposite_signal=bool(self.v["opp_exit"].get()),
+                           signal_source="confluence" if str(self.v["signal_source"].get()).startswith("NVDA")
+                           else "trend",
                            use_reversal_signals=bool(self.v["reversals"].get()))
         if not P.min_dte <= P.target_dte <= P.max_dte:
             raise ValueError("DTE must satisfy Min <= Target <= Max")
+        if P.signal_source == "confluence" and "NVDA" not in L.allowed_symbols:
+            raise ValueError("NVDA confluence trades NVDA: add NVDA to Symbols")
         return L, P
 
     def save(self) -> None:

@@ -182,8 +182,12 @@ class ChartCanvas(tk.Canvas):
     the visible range, resize, zoom/pan). Mouse: wheel = zoom, drag = pan back in time, double-click = live.
     """
 
-    def __init__(self, master, bars_shown: int = DEFAULT_SHOWN, max_fps: float = 30.0, **kw):
+    def __init__(self, master, bars_shown: int = DEFAULT_SHOWN, max_fps: float = 30.0, compact: bool = False, **kw):
         super().__init__(master, bg=C["bg"], highlightthickness=0, **kw)
+        self.compact = compact              # small tile: short legend, no marker letters
+        self.title: Optional[str] = None    # legend title (defaults to the symbol)
+        self.title_color = C["last"]
+        self._default_shown = bars_shown
         self.bars_shown = bars_shown
         self.offset = 0                     # bars scrolled back from the latest (0 = following live)
         self.min_full_s = 0.2               # full redraws at most 5/s
@@ -219,7 +223,14 @@ class ChartCanvas(tk.Canvas):
             self._pending = None
 
     # -------------------------------------------------- data
-    def set_data(self, symbol: str, bars: List[Dict[str, Any]], in_session: Optional[List[bool]] = None) -> None:
+    def set_data(self, symbol: str, bars: List[Dict[str, Any]], in_session: Optional[List[bool]] = None,
+                 signals: Optional[List[Signal]] = None, title: Optional[str] = None,
+                 title_color: Optional[str] = None) -> None:
+        """`signals`: None = compute this chart's own trend/reversal markers; a list (possibly empty) = show
+        exactly those (e.g. confluence markers on NVDA, none on the other tiles)."""
+        new_title = (title, title_color or C["last"])
+        title_changed = new_title != (self.title, self.title_color)
+        self.title, self.title_color = title, title_color or C["last"]
         bars = [b for b in bars if b.get("close") is not None]
         same_bars = (symbol == self.symbol and self.bars and len(bars) == len(self.bars)
                      and bars[-1]["t"] == self.bars[-1]["t"]
@@ -227,8 +238,14 @@ class ChartCanvas(tk.Canvas):
                                             and bars[-2]["close"] == self.bars[-2]["close"])))
         self.symbol, self.bars, self._in_session = symbol, bars, in_session
         self.series = compute_series(bars, in_session) if bars else None
-        if not same_bars:  # signals only change when a bar closes
-            self.signals = find_signals(bars, self.series) if self.series and len(bars) > WARMUP else []
+        if signals is not None:
+            changed = [(x.i, x.side) for x in signals] != [(x.i, x.side) for x in self.signals]
+            self.signals = list(signals)
+            if changed:
+                same_bars = False
+        if not same_bars or title_changed:  # signals only change when a bar closes
+            if signals is None:
+                self.signals = find_signals(bars, self.series) if self.series and len(bars) > WARMUP else []
             self._full()
         else:
             self._incremental()
@@ -242,7 +259,7 @@ class ChartCanvas(tk.Canvas):
                              fill=C["text"], font=("Segoe UI", 10))
 
     def go_live(self) -> None:
-        self.offset, self.bars_shown = 0, DEFAULT_SHOWN
+        self.offset, self.bars_shown = 0, self._default_shown
         self._full(force=True)
 
     # -------------------------------------------------- scheduling
@@ -414,13 +431,13 @@ class ChartCanvas(tk.Canvas):
                 yy = y(b.get("low") or b["close"]) + 12
                 self.create_polygon(x(sg.i), yy - 8, x(sg.i) - 6, yy + 3, x(sg.i) + 6, yy + 3, fill=C["up"],
                                     outline=C["bg"], width=1.5)
-                self.create_text(x(sg.i), yy + 5, text="B" if sg.kind == "trend" else "b", anchor="n",
+                self.create_text(x(sg.i), yy + 5, text="b" if sg.kind == "reversal" else "B", anchor="n",
                                  fill=C["up"], font=("Segoe UI", 8, "bold"))
             else:
                 yy = y(b.get("high") or b["close"]) - 12
                 self.create_polygon(x(sg.i), yy + 8, x(sg.i) - 6, yy - 3, x(sg.i) + 6, yy - 3, fill=C["down"],
                                     outline=C["bg"], width=1.5)
-                self.create_text(x(sg.i), yy - 5, text="S" if sg.kind == "trend" else "s", anchor="s",
+                self.create_text(x(sg.i), yy - 5, text="s" if sg.kind == "reversal" else "S", anchor="s",
                                  fill=C["down"], font=("Segoe UI", 8, "bold"))
 
         lc = self.bars[-1]["close"]                          # last price (always the latest, even when panned)
@@ -430,8 +447,11 @@ class ChartCanvas(tk.Canvas):
             self.create_text(x1 + 4, y(lc), text=_fmt_px(lc), anchor="w", fill=C["last"],
                              font=("Consolas", 8, "bold"), tags=("last_text",))
 
-        legend = [(self.symbol, C["last"]), ("VWAP", C["vwap"]), ("EMA9", C["ema9"]), ("EMA20", C["ema20"]),
-                  ("▲B/▼S trend  ▲b/▼s reversal · signals, not advice", C["text"])]
+        if self.compact:
+            legend = [(self.title or self.symbol, self.title_color)]
+        else:
+            legend = [(self.title or self.symbol, self.title_color), ("VWAP", C["vwap"]), ("EMA9", C["ema9"]),
+                      ("EMA20", C["ema20"]), ("▲B/▼S trend  ▲b/▼s reversal · signals, not advice", C["text"])]
         lx = x0 + 2
         for text, col in legend:
             t = self.create_text(lx, 4, text=text, anchor="nw", fill=col, font=("Segoe UI", 8, "bold"))

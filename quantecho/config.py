@@ -39,6 +39,7 @@ class Settings:
     first_run_done: bool = False
     ask_source_on_launch: bool = True  # show the source picker every launch (has a "don't ask again" box)
     ai_backend: str = "builtin"        # "builtin" (bundled llama.cpp + Qwen3 4B) or "ollama"
+    chart_view: str = "focus"          # "focus" (one big chart) or "confluence" (6-chart NVDA confluence grid)
     creds: Dict[str, str] = field(default_factory=dict)
     trading: Dict[str, Any] = field(default_factory=dict)  # options-bot settings (no secrets; those use the keyring)
 
@@ -107,6 +108,8 @@ def load_settings(path: Path = SETTINGS_PATH) -> Settings:
     if saved and "ai_backend" not in saved and not os.getenv("AI_BACKEND"):
         s.ai_backend = "ollama"  # existing users keep the Ollama setup they already have
 
+    if saved.get("chart_view") in ("focus", "confluence"):
+        s.chart_view = saved["chart_view"]
     if isinstance(saved.get("trading"), dict):
         s.trading = dict(saved["trading"])
     saved_creds = saved.get("creds") if isinstance(saved.get("creds"), dict) else {}
