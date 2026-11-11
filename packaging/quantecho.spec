@@ -11,7 +11,8 @@ a = Analysis(
     datas=[(str(ROOT / "quantecho" / "assets"), "quantecho/assets"), *collect_data_files("tzdata")],
     hiddenimports=[*collect_submodules("quantecho.providers"), "keyring.backends.Windows", "websocket"],
     # schwab-py is optional (Schwab users run from source); keep the bundle lean
-    excludes=["schwab", "numpy", "pandas", "matplotlib", "PIL", "pytest", "IPython"],
+    excludes=["schwab", "numpy", "pandas", "matplotlib", "PIL", "pytest", "IPython",
+              "quantecho.trading"],  # options trading is source-only, never in the Store build
     noarchive=False,
 )
 pyz = PYZ(a.pure)

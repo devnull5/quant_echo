@@ -36,6 +36,15 @@ C = {
 }
 
 LABEL_TO_ID = {spec.label: pid for pid, spec in PROVIDERS.items()}
+
+
+def _trading_available() -> bool:
+    """The options bot ships only with source checkouts; the Store build excludes quantecho.trading."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec("quantecho.trading") is not None
+    except (ImportError, ValueError):
+        return False
 _BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 _HEAD = re.compile(r"^(#{1,4} )", re.M)
 
@@ -90,6 +99,7 @@ class App(tk.Tk):
         self._render_provider_panel()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.ticks = None                 # real-time focus tick stream (see stream.py)
+        self.trading_panel = None         # options bot window (source builds only; see quantecho/trading)
         self._chart_bars: list = []       # telemetry bars + replayed ticks
         self._chart_sess: list = []
         self._chart_base_at = -1
@@ -156,6 +166,8 @@ class App(tk.Tk):
         ttk.Button(bar, text="▶ Start", command=self.on_start_clicked).pack(side="left", padx=(12, 4))
         ttk.Button(bar, text="■ Stop", command=self.on_stop).pack(side="left")
         ttk.Button(bar, text="⚙ Settings", command=self._toggle_settings).pack(side="left", padx=(12, 0))
+        if _trading_available():  # not in the Store build
+            ttk.Button(bar, text="📈 Trading", command=self.open_trading).pack(side="left", padx=(6, 0))
         ttk.Label(bar, textvariable=self.v_status, style="Muted.TLabel").pack(side="right", padx=10)
 
         # --- settings panel (hidden by default)
@@ -347,6 +359,8 @@ class App(tk.Tk):
                     self._ai_busy(False)
                 elif kind == "signal":
                     self.log(f"[{self._ts()}] ⚡ {payload.text}", payload.kind if payload.kind != "info" else "muted")
+                elif kind in ("bot", "bot_status", "bot_confirm"):
+                    self._bot_event(kind, payload)
                 elif kind == "tick":
                     self._on_tick(payload)
                 elif kind == "quotes":
@@ -806,7 +820,35 @@ class App(tk.Tk):
         except (AttributeError, OSError):
             webbrowser.open(path.as_uri())
 
+    # ---------- options bot (source builds only)
+    def open_trading(self) -> None:
+        from .trading.panel import TradingPanel
+        if self.trading_panel is None or not self.trading_panel.winfo_exists():
+            self.trading_panel = TradingPanel(self)
+        self.trading_panel.deiconify()
+        self.trading_panel.lift()
+
+    def _bot_event(self, kind: str, payload) -> None:
+        panel = self.trading_panel
+        if kind == "bot_confirm" and (panel is None or not panel.winfo_exists()):
+            payload.answer = False          # no window to ask in -> decline
+            payload.done.set()
+            return
+        if kind == "bot":
+            tag = "bull" if "filled_entry" in payload else "bear" if "filled_exit" in payload else "muted"
+            self.log(payload, tag)
+        if panel is not None and panel.winfo_exists():
+            panel.handle(kind, payload)
+
     def _on_close(self) -> None:
+        panel = self.trading_panel
+        if panel is not None and panel.winfo_exists() and panel.bot is not None:
+            n = panel.open_positions()
+            if n and not messagebox.askyesno(
+                    "Open positions", f"The trading bot holds {n} open position(s). Closing QuantEcho stops the bot "
+                    "and they will NOT be managed (no stops or exits). Close anyway?", icon="warning"):
+                return
+            panel.bot.stop()
         self.on_stop()
         engine.ENGINE.stop()  # shut down the bundled AI server, if it was started
         for job in (getattr(self, "_pump_job", None), getattr(self, "_auto_job", None)):

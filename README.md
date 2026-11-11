@@ -120,6 +120,42 @@ OHLCV and the reason for its marker. These are mechanical technical signals, **n
 - Volume glitches (single bars >15x the session median, common in Yahoo 1-min data) are capped
   before VWAP/relative volume are computed.
 
+## Options trading bot (tastytrade, experimental, source-only)
+
+`quantecho/trading/` can trade **long calls and puts only** (max loss = premium paid) on an allowlist
+(default **SPY, NVDA**), entering on the chart's closed-bar **trend** signals (B → call, S → put). It is
+**off by default and not included in the Microsoft Store build.** Not financial advice: the signals have no
+proven edge, so run it in SIM and sandbox for a long time before considering real money.
+
+| Mode | What happens |
+|---|---|
+| `sim` | Local paper trading. Option prices are **modeled** (Black-Scholes, per-symbol IV) unless real quotes are configured. |
+| `sandbox` | Real orders to tastytrade's paper environment (`api.cert.tastyworks.com`, resets daily). |
+| `live` | Real money. Refuses to start without per-order confirmation. |
+
+**Rules** (`strategy.py`): expiry nearest 7 DTE (2-14), ATM strike; exit at +50% / -40%, on the opposite trend
+signal, before expiry (15:45 ET when expiring today/tomorrow) or after 5 days.
+**Hard limits** (`risk.py`, not overridable by the strategy): $300 max premium per trade, 2 contracts, 2 open
+positions, one per symbol, $300 daily loss limit (halts entries), 6 entries/day, max 10% bid/ask spread,
+entries only 09:45-15:30 ET on weekdays. **Kill switch** cancels working orders, sells everything at the bid
+and halts for the day.
+**Order safety** (`tasty.py`): limit orders only; every order is **dry-run first** (any warning blocks it);
+a unique `external-identifier` per order, and a timed-out submit is looked up, **never blindly resent**.
+Every decision is journaled to `~/.quanteco_gpt/trades/YYYY-MM-DD.jsonl`.
+
+**Using it:** click **📈 Trading** in the toolbar (source checkouts only). Pick a mode, enter credentials
+(stored in Windows Credential Manager), use **Test** to verify the connection, set limits/strategy, then
+**▶ Start bot**. The bot needs a *stock* data source (e.g. Yahoo, Alpaca or Simulated) selected in the main
+window. With **Confirm every order** (always on for LIVE) each order pops up for your yes/no; unanswered
+in 60 s = no. LIVE also requires typing `REAL MONEY`. Closing QuantEcho while positions are open asks first,
+because nothing manages them after the bot stops.
+
+**tastytrade setup** (OAuth2; the old username/password login was retired in 2026): create an OAuth
+application and a grant at my.tastytrade.com (Manage → My Profile → API) to get a **client secret** and
+**refresh token**. The sandbox needs its own sandbox account and credentials (developer.tastytrade.com/sandbox).
+The sandbox has no market data, so sandbox mode uses modeled prices to choose limits unless you also provide
+read-only production credentials for real quotes.
+
 ## Run
 
 ```bash

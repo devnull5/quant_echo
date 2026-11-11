@@ -40,6 +40,7 @@ class Settings:
     ask_source_on_launch: bool = True  # show the source picker every launch (has a "don't ask again" box)
     ai_backend: str = "builtin"        # "builtin" (bundled llama.cpp + Qwen3 4B) or "ollama"
     creds: Dict[str, str] = field(default_factory=dict)
+    trading: Dict[str, Any] = field(default_factory=dict)  # options-bot settings (no secrets; those use the keyring)
 
 
 _ENV = {
@@ -106,6 +107,8 @@ def load_settings(path: Path = SETTINGS_PATH) -> Settings:
     if saved and "ai_backend" not in saved and not os.getenv("AI_BACKEND"):
         s.ai_backend = "ollama"  # existing users keep the Ollama setup they already have
 
+    if isinstance(saved.get("trading"), dict):
+        s.trading = dict(saved["trading"])
     saved_creds = saved.get("creds") if isinstance(saved.get("creds"), dict) else {}
     for f in all_fields():
         # precedence: OS keyring -> settings file (older versions stored secrets there) -> env/.env -> default
