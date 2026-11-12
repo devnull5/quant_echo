@@ -242,11 +242,24 @@ class TradingPanel(tk.Toplevel):
                 bal = c.balances()
                 chain = c.option_chain("SPY")
                 first = chain[0] if chain else None
-                msg = (f"✔ {env}: account …{acct[-4:]} | buying power "
-                       f"{bal.get('derivative-buying-power', bal.get('equity-buying-power', '?'))} | SPY chain: "
-                       f"{len(chain)} expirations"
+                def num(k):
+                    try:
+                        return float(bal.get(k) or 0)
+                    except (TypeError, ValueError):
+                        return 0.0
+                cash, nlv, obp = num("cash-balance"), num("net-liquidating-value"), num("derivative-buying-power")
+                msg = (f"✔ {env}: account …{acct[-4:]} | cash ${cash:,.2f} | net liq ${nlv:,.2f} | "
+                       f"options buying power ${obp:,.2f} | SPY chain: {len(chain)} expirations"
                        + (f", first {first.expiry} with {len(first.strikes)} strikes" if first else
                           " (could not parse; please report)"))
+                if obp <= 0 < cash:
+                    if env == "sandbox":
+                        msg += ("\n   ↳ sandbox quirk: its balances report $0 buying power, but its ORDER checks use a "
+                                "simulated $1,000,000 and don't charge premium. Orders won't be blocked; QuantEcho's "
+                                "own limits ($/trade, positions, daily loss) and journal are what count.")
+                    else:
+                        msg += ("\n   ⚠ tastytrade reports $0 options buying power: orders will be REJECTED "
+                                "until funds settle.")
             except Exception as e:
                 msg = f"✖ {env}: {type(e).__name__}: {e}"
             self.app.events.put(("bot", msg))
