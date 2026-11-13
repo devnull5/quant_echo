@@ -30,10 +30,11 @@ class StrategyParams:
     min_dte: int = 2
     max_dte: int = 14
     strikes_otm: int = 0                 # 0 = nearest ATM, 1 = one strike out of the money, ...
-    take_profit_pct: float = 0.50        # +50% on premium
-    stop_loss_pct: float = 0.40          # -40% on premium
-    trail_arm_pct: float = 0.15          # trailing stop arms once the premium is up this much...
-    trail_giveback_pct: float = 0.05     # ...and sells if the gain then falls this many points off its peak (0 = off)
+    take_profit_pct: Optional[float] = None  # fixed take-profit (None = off; the trailing stop takes profits)
+    stop_loss_pct: float = 0.05          # hard stop: -5% on premium
+    trailing_stop: bool = True           # trailing stop on the premium:
+    trail_arm_pct: float = 0.16          # ...arms once the premium is up this much...
+    trail_giveback_pct: float = 0.03     # ...and sells if the gain then falls this many points off its peak
     fade_exit: bool = True               # once armed, also sell when the underlying closes back across EMA9
     exit_on_opposite_signal: bool = True
     flatten_at: str = "15:45"            # ET: from here on, close positions (all of them if close_all_eod)
@@ -83,7 +84,7 @@ def exit_reason(entry_price: float, mark: float, contract: OptionContract, opene
     now = now.astimezone(NY)
     if entry_price > 0:
         chg = (mark - entry_price) / entry_price
-        if chg >= p.take_profit_pct:
+        if p.take_profit_pct and chg >= p.take_profit_pct:
             return f"take profit ({chg:+.0%})"
         if chg <= -p.stop_loss_pct:
             return f"stop loss ({chg:+.0%})"
@@ -103,7 +104,7 @@ def exit_reason(entry_price: float, mark: float, contract: OptionContract, opene
 
 
 def trail_armed(entry_price: float, peak: float, p: StrategyParams) -> bool:
-    return p.trail_giveback_pct > 0 and entry_price > 0 and (peak - entry_price) / entry_price >= p.trail_arm_pct - 1e-9
+    return p.trailing_stop and p.trail_giveback_pct > 0 and entry_price > 0 and (peak - entry_price) / entry_price >= p.trail_arm_pct - 1e-9
 
 
 def trail_reason(entry_price: float, mark: float, peak: float, p: StrategyParams) -> Optional[str]:

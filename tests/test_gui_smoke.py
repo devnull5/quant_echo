@@ -136,15 +136,19 @@ class TestGuiSmoke(unittest.TestCase):
         self.pump(0.3)
         self.assert_on_top(self.app.chart, "chart")
         self.assertGreater(self.app.chart.winfo_height(), 150)
-        rects = [i for i in self.app.chart.find_all() if self.app.chart.type(i) == "rectangle"]
-        self.assertGreater(len(rects), 60)                       # candle bodies + volume bars
-        lines = [i for i in self.app.chart.find_all() if self.app.chart.type(i) == "line"]
-        self.assertGreater(len(lines), 30)                       # wicks + overlays + grid
-        # hover readout appears over a candle
         c = self.app.chart
-        c.event_generate("<Motion>", x=c.winfo_width() // 2, y=c.winfo_height() // 3)
-        self.pump(0.1)
-        self.assertTrue(c.find_withtag("hover"))
+
+        def count(kind):
+            return sum(1 for i in c.find_all() if c.type(i) == kind)
+        # polled, not one-shot: a live tick can trigger a redraw between our steps (flaky on slow CI runners)
+        self.assertTrue(self.wait_for(lambda: count("rectangle") > 60, 3), "too few candles/volume bars")
+        self.assertTrue(self.wait_for(lambda: count("line") > 30, 3), "too few wicks/overlays/grid lines")
+
+        def hovered():                                           # hover readout appears over a candle
+            c.event_generate("<Motion>", x=c.winfo_width() // 2, y=c.winfo_height() // 3)
+            self.app.update()
+            return bool(c.find_withtag("hover"))
+        self.assertTrue(self.wait_for(hovered, 3), "no hover readout")
 
     def test_ta_strip_fills(self):
         self.app.on_start_clicked()

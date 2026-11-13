@@ -179,6 +179,15 @@ class TestTradingPanel(unittest.TestCase):
         self.assertEqual(cfg._keyring.d[("quantecho", "tasty_sandbox_secret")], "SANDBOX-SECRET")
         self.assertNotIn("SANDBOX-SECRET", str(self.app.settings.trading))
 
+    def test_saved_trading_settings_survive_main_save(self):
+        p = self.open()
+        p.v["max_premium"].set("5000")
+        p.v["trailing"].set(False)
+        p.save()
+        self.app.on_save()                       # the main window's own save used to drop them
+        self.assertEqual(str(self.app.settings.trading["max_premium"]), "5000")
+        self.assertFalse(self.app.settings.trading["trailing"])
+
 
 if __name__ == "__main__":
     unittest.main()

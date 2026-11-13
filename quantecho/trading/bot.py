@@ -5,6 +5,7 @@ SIM broker; `run()` wraps it in a background thread.
 """
 from __future__ import annotations
 
+import csv
 import json
 import queue
 import threading
@@ -81,6 +82,7 @@ class BotStatus:
     entries_today: int = 0
     positions: List[Dict[str, Any]] = field(default_factory=list)
     last_event: str = ""
+    lifetime_realized: float = 0.0         # all closed trades ever, this mode (pnl_ledger.csv)
 
 
 class TradingBot:
@@ -95,6 +97,8 @@ class TradingBot:
         self.journal_dir = journal_dir if journal_dir is not None else JOURNAL_DIR   # resolved at runtime
         self.bars_every_s = bars_every_s
         self.state = DayState()
+        self.lifetime_pnl = 0.0
+        self._load_ledger()
         self.positions: Dict[str, Position] = {}       # by underlying
         self.pending: Dict[str, Pending] = {}          # by ext_id
         self._bars: Dict[str, List[Dict[str, Any]]] = {}
@@ -130,7 +134,48 @@ class TradingBot:
             return BotStatus(self.mode, bool(self.thread and self.thread.is_alive()), self.state.halted,
                              self.state.halt_reason, round(self.state.realized_pnl, 2),
                              round(sum(p.pnl for p in self.positions.values()), 2), self.state.entries,
-                             [p.row() for p in self.positions.values()])
+                             [p.row() for p in self.positions.values()], lifetime_realized=round(self.lifetime_pnl, 2))
+
+    # ---------------------------------------------------------------- P&L ledger (one row per closed trade)
+    LEDGER_FIELDS = ("closed_at", "mode", "contract", "qty", "entry", "exit", "pnl", "reason")
+
+    @property
+    def ledger_path(self) -> Path:
+        return self.journal_dir / "pnl_ledger.csv"
+
+    def _load_ledger(self) -> None:
+        """Lifetime realized P&L for this mode, and today's (so a restart doesn't reset the daily loss limit)."""
+        today = self.clock().date().isoformat()
+        life = day = 0.0
+        try:
+            with self.ledger_path.open(newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if row.get("mode") != self.mode:
+                        continue
+                    pnl = float(row.get("pnl") or 0)
+                    life += pnl
+                    if str(row.get("closed_at", "")).startswith(today):
+                        day += pnl
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            log.warning(f"P&L ledger unreadable: {e}")
+        self.lifetime_pnl = life
+        self.state.roll(today)
+        self.state.realized_pnl = day
+
+    def _record_pnl(self, p: Position, fill: float, pnl: float, why: str) -> None:
+        try:
+            self.journal_dir.mkdir(parents=True, exist_ok=True)
+            new = not self.ledger_path.exists()
+            with self.ledger_path.open("a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(self.LEDGER_FIELDS)
+                w.writerow([self.clock().isoformat(timespec="seconds"), self.mode, p.contract.label(), p.qty,
+                            p.entry_price, fill, pnl, why])
+        except OSError as e:
+            log.warning(f"P&L ledger write failed: {e}")
 
     # ---------------------------------------------------------------- data
     def _refresh(self, sym: str) -> List[Dict[str, Any]]:
@@ -336,7 +381,9 @@ class TradingBot:
     def _closed(self, p: Position, fill: float, why: str) -> None:
         pnl = round((fill - p.entry_price) * p.qty * 100, 2)
         self.state.realized_pnl += pnl
+        self.lifetime_pnl += pnl
         self.positions.pop(p.contract.root, None)
+        self._record_pnl(p, fill, pnl, why)
         self.journal("filled_exit", contract=p.contract.label(), qty=p.qty, entry=p.entry_price, exit=fill, pnl=pnl,
                      reason=why)
 
@@ -349,7 +396,7 @@ class TradingBot:
                 if pd.kind == "entry":
                     self._opened(pd.contract, pd.qty, r.fill_price or pd.limit, True, now)
                 else:
-                    self._closed(pd.position, r.fill_price or pd.limit, "exit filled")
+                    self._closed(pd.position, r.fill_price or pd.limit, pd.position.exit_why or "exit filled")
             elif r.status in ("rejected", "cancelled"):
                 self.pending.pop(ext)
                 self.journal(f"{pd.kind}_{r.status}", contract=pd.contract.label(), message=r.message)
@@ -400,7 +447,10 @@ class TradingBot:
         self.journal("bot_started", broker=self.broker.name, symbols=" ".join(L.allowed_symbols),
                      rules=(f"${L.max_premium_per_trade:,.0f}/trade, max {L.max_contracts_per_trade} contracts, "
                             f"{L.max_open_positions} open, daily loss ${L.daily_loss_limit:,.0f}; {P.target_dte} DTE "
-                            f"({P.min_dte}-{P.max_dte}), TP +{P.take_profit_pct:.0%} / SL -{P.stop_loss_pct:.0%}"),
+                            f"({P.min_dte}-{P.max_dte}), SL -{P.stop_loss_pct:.0%}"
+                            + (f", TP +{P.take_profit_pct:.0%}" if P.take_profit_pct else "")
+                            + (f", trail after +{P.trail_arm_pct:.0%} give back {P.trail_giveback_pct:.0%}"
+                               if P.trailing_stop else ", no trailing stop")),
                      limits=L.to_dict(), params=P.to_dict())
 
         def run():

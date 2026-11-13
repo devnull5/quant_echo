@@ -58,8 +58,8 @@ class TradingPanel(tk.Toplevel):
             "min_dte": tk.StringVar(value=str(t.get("min_dte", P.min_dte))),
             "max_dte": tk.StringVar(value=str(t.get("max_dte", P.max_dte))),
             "strikes_otm": tk.StringVar(value=str(t.get("strikes_otm", P.strikes_otm))),
-            "tp": tk.StringVar(value=str(int(t.get("tp", P.take_profit_pct * 100)))),
-            "sl": tk.StringVar(value=str(int(t.get("sl", P.stop_loss_pct * 100)))),
+            "sl": tk.StringVar(value=str(t.get("sl", round(P.stop_loss_pct * 100)))),
+            "trailing": tk.BooleanVar(value=bool(t.get("trailing", P.trailing_stop))),
             "opp_exit": tk.BooleanVar(value=bool(t.get("opp_exit", P.exit_on_opposite_signal))),
             "reversals": tk.BooleanVar(value=bool(t.get("reversals", P.use_reversal_signals))),
             "join_trend": tk.BooleanVar(value=bool(t.get("join_trend", P.join_trend_on_start))),
@@ -137,14 +137,14 @@ class TradingPanel(tk.Toplevel):
         self._row(s1, "Min", self.v["min_dte"], 3)
         self._row(s1, "Max", self.v["max_dte"], 3)
         self._row(s1, "Strikes OTM", self.v["strikes_otm"], 3)
-        self._row(s2, "Take profit %", self.v["tp"], 4)
-        self._row(s2, "Stop %", self.v["sl"], 4)
+        self._row(s2, "Hard stop -%", self.v["sl"], 4)
         ttk.Checkbutton(s2, text="Exit on opposite signal", variable=self.v["opp_exit"]).pack(side="left", padx=6)
         ttk.Checkbutton(s2, text="+ reversals", variable=self.v["reversals"]).pack(side="left")
         ttk.Checkbutton(s2, text="Join trend at start", variable=self.v["join_trend"]).pack(side="left", padx=6)
         s_tr = ttk.Frame(strat)
         s_tr.pack(fill="x", pady=(0, 4))
-        self._row(s_tr, "Trail after +%", self.v["trail_arm"], 4)
+        ttk.Checkbutton(s_tr, text="Trailing stop:", variable=self.v["trailing"]).pack(side="left", padx=(8, 0))
+        self._row(s_tr, "arm at +%", self.v["trail_arm"], 4)
         self._row(s_tr, "give back %", self.v["trail_give"], 4)
         ttk.Checkbutton(s_tr, text="Sell when momentum fades", variable=self.v["fade_exit"]).pack(side="left", padx=6)
         ttk.Checkbutton(s_tr, text="Close all by 15:45", variable=self.v["close_eod"]).pack(side="left")
@@ -193,8 +193,8 @@ class TradingPanel(tk.Toplevel):
                        max_entries_per_day=self._num("max_entries", int, 1, 100))
         P = StrategyParams(target_dte=self._num("target_dte", int, 0, 60), min_dte=self._num("min_dte", int, 0, 60),
                            max_dte=self._num("max_dte", int, 0, 90), strikes_otm=self._num("strikes_otm", int, 0, 10),
-                           take_profit_pct=self._num("tp", float, 1, 1000) / 100,
-                           stop_loss_pct=self._num("sl", float, 1, 100) / 100,
+                           stop_loss_pct=self._num("sl", float, 0.5, 100) / 100,
+                           trailing_stop=bool(self.v["trailing"].get()),
                            exit_on_opposite_signal=bool(self.v["opp_exit"].get()),
                            signal_source="confluence" if str(self.v["signal_source"].get()).startswith("NVDA")
                            else "trend",
@@ -357,8 +357,10 @@ class TradingPanel(tk.Toplevel):
     def _show_status(self, s) -> None:
         state = "RUNNING" if s.running else "stopped"
         halt = f" · HALTED ({s.halt_reason})" if s.halted else ""
-        self.v_status.set(f"{s.mode.upper()} · {state}{halt} · realized ${s.realized_today:,.2f} · "
-                          f"open ${s.open_pnl:,.2f} · entries today {s.entries_today}")
+        day = s.realized_today + s.open_pnl
+        self.v_status.set(f"{s.mode.upper()} · {state}{halt} · today ${day:+,.2f} (realized ${s.realized_today:+,.2f}, "
+                          f"open ${s.open_pnl:+,.2f}) · lifetime ${s.lifetime_realized:+,.2f} · "
+                          f"entries today {s.entries_today}")
         self.pos.delete(*self.pos.get_children())
         for p in s.positions:
             self.pos.insert("", "end", text=p["label"],

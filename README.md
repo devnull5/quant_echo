@@ -133,11 +133,11 @@ proven edge, so run it in SIM and sandbox for a long time before considering rea
 | `sandbox` | Real orders to tastytrade's paper environment (`api.cert.tastyworks.com`, resets daily). |
 | `live` | Real money. Refuses to start without per-order confirmation. |
 
-**Rules** (`strategy.py`): expiry nearest 7 DTE (2-14), ATM strike; exit at +50% / -40%, on the opposite trend
-signal, before expiry (15:45 ET when expiring today/tomorrow) or after 5 days.
-**Dynamic exit** (on by default): once the premium is up +15% a trailing stop arms and sells if the gain
-falls 5 points off its best (e.g. ran to +30%, sells at +25%; confirmed on two checks so one bad quote can't
-trigger it). While armed it also sells when the underlying closes back across EMA9 (the move is over).
+**Rules** (`strategy.py`): expiry nearest 7 DTE (2-14), ATM strike. Exits: **hard stop -5%** on the premium,
+opposite trend signal, end-of-day flatten, or after 5 days. No fixed take-profit; the trailing stop takes profits.
+**Trailing stop** (checkbox, on by default): arms once the premium is up **+16%**, then sells the whole position
+if the gain drops **3 points** off its best (e.g. ran to +25%, sells at +22%; confirmed on two checks so one bad
+quote can't trigger it). While armed it also sells when the underlying closes back across EMA9 (the move is over).
 **End of day** (on by default): every position is closed from 15:45 ET, so the bot is flat overnight
 (untick "Close all by 15:45" to only flatten options expiring today/tomorrow). No orders are sent outside
 09:30-16:00 ET. An unfilled exit is cancelled and re-priced only after the broker confirms the cancel; a
@@ -151,6 +151,8 @@ and halts for the day.
 **Order safety** (`tasty.py`): limit orders only; every order is **dry-run first** (any warning blocks it);
 a unique `external-identifier` per order, and a timed-out submit is looked up, **never blindly resent**.
 Every decision is journaled to `~/.quanteco_gpt/trades/YYYY-MM-DD.jsonl`.
+Every closed trade is also appended to `~/.quanteco_gpt/trades/pnl_ledger.csv`; the panel shows today's P&L
+(realized + open) and lifetime realized P&L per mode, and a restart reloads today's P&L so the daily loss limit holds.
 
 **Using it:** click **📈 Trading** in the toolbar (source checkouts only). Pick a mode, enter credentials
 (stored in Windows Credential Manager), use **Test** to verify the connection, set limits/strategy, then

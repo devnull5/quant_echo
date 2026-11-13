@@ -190,7 +190,7 @@ class TestPricingRiskStrategy(unittest.TestCase):
         self.assertEqual((size_position(L, 1.0), size_position(L, 1.6), size_position(L, 3.5)), (2, 1, 0))
 
     def test_strategy_choices_and_exits(self):
-        p = StrategyParams()
+        p = StrategyParams(take_profit_pct=0.5, stop_loss_pct=0.4)
         today = date(2026, 11, 11)
         exps = [date(2026, 11, d) for d in (11, 12, 13, 16, 17, 18, 19, 20, 25)]
         self.assertEqual(choose_expiry(exps, today, p), date(2026, 11, 18))
@@ -247,7 +247,7 @@ class TestBotEndToEnd(unittest.TestCase):
                           journal_dir=Path(self.tmp.name), clock=lambda: self.now, bars_every_s=0, **kw)
 
     def test_signal_entry_fill_takeprofit_journal(self):
-        bot = self.make()
+        bot = self.make(params=StrategyParams(take_profit_pct=0.5))
         bot.step()                                         # signal -> entry order (working)
         self.assertEqual(len(bot.pending), 1)
         bot.step()                                         # limit >= mid -> filled
@@ -265,6 +265,20 @@ class TestBotEndToEnd(unittest.TestCase):
             self.assertIn(e, events)
         bot.step()
         self.assertEqual(bot.state.entries, 1)            # same signal never trades twice
+        # P&L ledger: one row per closed trade; a restarted bot reloads today's and lifetime P&L
+        import csv
+        rows = list(csv.DictReader((Path(self.tmp.name) / "pnl_ledger.csv").open(encoding="utf-8")))
+        self.assertEqual(len(rows), 1)
+        self.assertIn("take profit", rows[0]["reason"])
+        pnl = float(rows[0]["pnl"])
+        self.assertAlmostEqual(bot.status().lifetime_realized, pnl)
+        again = self.make()
+        self.assertAlmostEqual(again.lifetime_pnl, pnl)
+        self.assertAlmostEqual(again.state.realized_pnl, pnl)       # daily loss limit survives a restart
+        self.now = datetime(2026, 11, 12, 11, 0, tzinfo=NY)
+        tomorrow = self.make()
+        self.assertAlmostEqual(tomorrow.lifetime_pnl, pnl)
+        self.assertEqual(tomorrow.state.realized_pnl, 0)
 
     def test_kill_switch_closes_and_halts(self):
         bot = self.make()
@@ -347,13 +361,23 @@ class TestJoinTrendOnStart(unittest.TestCase):
 class TestDynamicExit(unittest.TestCase):
     def test_trail_and_fade_rules(self):
         from quantecho.trading.strategy import fade_reason, trail_armed, trail_reason
-        p = StrategyParams()                                     # arm +15%, give back 5 points
+        p = StrategyParams(trail_arm_pct=0.15, trail_giveback_pct=0.05)
         self.assertFalse(trail_armed(1.0, 1.14, p))
         self.assertIsNone(trail_reason(1.0, 1.05, 1.14, p))     # never armed -> the plain stop handles it
         self.assertIsNone(trail_reason(1.0, 1.11, 1.15, p))     # +15% -> +11%: within 5 points
         self.assertIn("trailing stop", trail_reason(1.0, 1.10, 1.15, p))
         self.assertIn("trailing stop", trail_reason(1.0, 1.35, 1.40, p))   # ratchets with the peak
         self.assertIsNone(trail_reason(1.0, 1.0, 1.5, StrategyParams(trail_giveback_pct=0)))  # off
+        self.assertIsNone(trail_reason(1.0, 1.0, 1.5, StrategyParams(trailing_stop=False)))   # box unticked
+        d = StrategyParams()                                     # defaults: arm +16%, give back 3, stop -5%, no TP
+        self.assertIsNone(trail_reason(1.0, 1.10, 1.15, d))      # +15% never armed
+        self.assertIsNone(trail_reason(1.0, 1.14, 1.16, d))      # +16% -> +14%: 2 points
+        self.assertIn("trailing stop", trail_reason(1.0, 1.13, 1.16, d))
+        c0 = OptionContract("SPY", date(2026, 11, 18), "C", 600)
+        t0, t1 = datetime(2026, 11, 11, 10, tzinfo=NY), datetime(2026, 11, 11, 11, tzinfo=NY)
+        self.assertIsNone(exit_reason(1.0, 3.0, c0, t0, t1, None, d))              # no hard take-profit
+        self.assertIsNone(exit_reason(1.0, 0.96, c0, t0, t1, None, d))
+        self.assertIn("stop loss", exit_reason(1.0, 0.95, c0, t0, t1, None, d))
         call = OptionContract("SPY", date(2026, 11, 18), "C", 600)
         put = OptionContract("SPY", date(2026, 11, 18), "P", 600)
         self.assertIn("faded", fade_reason(call, 599.0, 600.0))

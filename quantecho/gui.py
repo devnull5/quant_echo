@@ -356,6 +356,8 @@ class App(tk.Tk):
             first_run_done=True,
             ask_source_on_launch=bool(self.v_ask_launch.get()),
             creds={k: v.get().strip() for k, v in self.v_creds.items()},
+            chart_view=self.settings.chart_view,          # owned elsewhere: carry them over, don't reset
+            trading=dict(self.settings.trading or {}),
         )
 
     def _pump(self) -> None:
