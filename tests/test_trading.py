@@ -438,7 +438,7 @@ class TestExitSafety(unittest.TestCase):
         b.cancel = lambda oid: None                            # broker never confirms the cancel
         self.pos.urgent_exit, self.pos.exit_why = True, "stop loss (-45%)"
         old = botmod.EXIT_TIMEOUT_S
-        botmod.EXIT_TIMEOUT_S = 0
+        botmod.EXIT_TIMEOUT_S = -1                              # < 0: Windows monotonic() ticks every ~15 ms
         try:
             for _ in range(6):
                 self.bot.step()
