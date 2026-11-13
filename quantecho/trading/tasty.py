@@ -113,15 +113,22 @@ def round_to_tick(price: float, rules: TickRules, up: bool) -> float:
 
 
 def build_option_order(symbol: str, action: str, quantity: int, limit: float, ext_id: str,
-                       tif: str = "Day") -> Dict[str, Any]:
-    """Single-leg equity-option LIMIT order. Buying is a Debit, selling a Credit (API rejects mismatches)."""
+                       tif: str = "Day", market: bool = False) -> Dict[str, Any]:
+    """Single-leg equity-option LIMIT order. Buying is a Debit, selling a Credit (API rejects mismatches).
+    market=True builds a MARKET order, allowed only for Sell to Close (a stuck exit), never to open."""
     if action not in ("Buy to Open", "Sell to Close"):
         raise ValueError("long-options-only bot: actions are 'Buy to Open' and 'Sell to Close'")
     if quantity < 1 or int(quantity) != quantity:
         raise ValueError("quantity must be a positive whole number")
-    if not limit or limit <= 0:
+    if market and action != "Sell to Close":
+        raise ValueError("market orders are only used to close a position")
+    if not market and (not limit or limit <= 0):
         raise ValueError("limit price required")
     parse_occ(symbol)  # validates the symbol
+    if market:
+        return {"time-in-force": tif, "order-type": "Market", "source": SOURCE, "external-identifier": ext_id,
+                "legs": [{"instrument-type": "Equity Option", "symbol": symbol, "quantity": int(quantity),
+                          "action": action}]}
     return {
         "time-in-force": tif,
         "order-type": "Limit",

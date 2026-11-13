@@ -36,7 +36,8 @@ class Broker:
 
     def chain(self, root: str, spot: float) -> Chain: ...
     def quote(self, c: OptionContract, spot: float) -> OptionQuote: ...
-    def submit(self, c: OptionContract, action: str, qty: int, limit: float, ext_id: str) -> OrderResult: ...
+    def submit(self, c: OptionContract, action: str, qty: int, limit: float, ext_id: str,
+               market: bool = False) -> OrderResult: ...   # market=True: closing orders only
     def status(self, order_id: str, c: OptionContract, spot: float) -> OrderResult: ...
     def cancel(self, order_id: str) -> None: ...
 
@@ -71,6 +72,8 @@ class SimBroker(Broker):
         return model_quote(c, spot, self.iv.get(c.root))
 
     def _try_fill(self, o: Dict[str, Any], q: OptionQuote) -> Optional[float]:
+        if o.get("market"):
+            return q.bid                      # market sell: fills at the bid
         lim, mid = o["limit"], (q.bid + q.ask) / 2
         if o["action"].startswith("Buy"):
             if lim >= q.ask:
@@ -84,12 +87,13 @@ class SimBroker(Broker):
                 return lim
         return None
 
-    def submit(self, c, action, qty, limit, ext_id) -> OrderResult:
-        build_option_order(c.symbol, action, qty, limit, ext_id)   # same validation as the real thing
+    def submit(self, c, action, qty, limit, ext_id, market=False) -> OrderResult:
+        build_option_order(c.symbol, action, qty, limit, ext_id, market=market)   # same validation as the real thing
         with self._lock:
             self._n += 1
             oid = f"SIM-{self._n}"
-            self._orders[oid] = {"c": c, "action": action, "qty": qty, "limit": limit, "status": "working"}
+            self._orders[oid] = {"c": c, "action": action, "qty": qty, "limit": limit, "status": "working",
+                                 "market": market}
         return OrderResult("working", oid, message="accepted (sim)")
 
     def status(self, order_id, c, spot) -> OrderResult:
@@ -163,8 +167,8 @@ class TastyBroker(Broker):
                 return q
         return model_quote(c, spot, self.iv.get(c.root))  # sandbox has no market data
 
-    def submit(self, c, action, qty, limit, ext_id) -> OrderResult:
-        order = build_option_order(c.symbol, action, qty, limit, ext_id)
+    def submit(self, c, action, qty, limit, ext_id, market=False) -> OrderResult:
+        order = build_option_order(c.symbol, action, qty, limit, ext_id, market=market)
         dr = self.client.dry_run(order)
         problems = [w.get("message", str(w)) for w in (dr.get("errors") or []) + (dr.get("warnings") or [])]
         if problems:

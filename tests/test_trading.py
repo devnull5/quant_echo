@@ -361,23 +361,35 @@ class TestJoinTrendOnStart(unittest.TestCase):
 class TestDynamicExit(unittest.TestCase):
     def test_trail_and_fade_rules(self):
         from quantecho.trading.strategy import fade_reason, trail_armed, trail_reason
-        p = StrategyParams(trail_arm_pct=0.15, trail_giveback_pct=0.05)
+        p = StrategyParams(trail_arm_pct=0.15, trail_giveback_pct=0.05, trail_giveback_frac=0)
         self.assertFalse(trail_armed(1.0, 1.14, p))
         self.assertIsNone(trail_reason(1.0, 1.05, 1.14, p))     # never armed -> the plain stop handles it
         self.assertIsNone(trail_reason(1.0, 1.11, 1.15, p))     # +15% -> +11%: within 5 points
         self.assertIn("trailing stop", trail_reason(1.0, 1.10, 1.15, p))
         self.assertIn("trailing stop", trail_reason(1.0, 1.35, 1.40, p))   # ratchets with the peak
-        self.assertIsNone(trail_reason(1.0, 1.0, 1.5, StrategyParams(trail_giveback_pct=0)))  # off
+        self.assertIsNone(trail_reason(1.0, 1.0, 1.5, StrategyParams(trail_giveback_pct=0, trail_giveback_frac=0)))
         self.assertIsNone(trail_reason(1.0, 1.0, 1.5, StrategyParams(trailing_stop=False)))   # box unticked
-        d = StrategyParams()                                     # defaults: arm +16%, give back 3, stop -5%, no TP
+        d = StrategyParams(stop_loss_pct=0.05, trail_giveback_frac=0.25)   # arm +16%, 3 pts + 25%, stop -5%, no TP
         self.assertIsNone(trail_reason(1.0, 1.10, 1.15, d))      # +15% never armed
         self.assertIsNone(trail_reason(1.0, 1.14, 1.16, d))      # +16% -> +14%: 2 points
         self.assertIn("trailing stop", trail_reason(1.0, 1.13, 1.16, d))
+        # giveback widens with the gain: 3 pts + 25% of the gain above +16%
+        self.assertIsNone(trail_reason(1.0, 1.32, 1.40, d))      # +40% -> +32%: 8 pts < 9 allowed
+        self.assertIn("trailing stop", trail_reason(1.0, 1.31, 1.40, d))
+        self.assertIsNone(trail_reason(1.0, 2.26, 2.65, d))      # 2026-11-13 trend day: +165% -> +126% holds
+        self.assertIn("trailing stop", trail_reason(1.0, 2.24, 2.65, d))   # ... sells at ~+125%
         c0 = OptionContract("SPY", date(2026, 11, 18), "C", 600)
         t0, t1 = datetime(2026, 11, 11, 10, tzinfo=NY), datetime(2026, 11, 11, 11, tzinfo=NY)
         self.assertIsNone(exit_reason(1.0, 3.0, c0, t0, t1, None, d))              # no hard take-profit
         self.assertIsNone(exit_reason(1.0, 0.96, c0, t0, t1, None, d))
         self.assertIn("stop loss", exit_reason(1.0, 0.95, c0, t0, t1, None, d))
+        n = StrategyParams()                                     # defaults: 3 pts + 50% above +16%, stop -15%
+        self.assertIsNone(trail_reason(1.0, 1.26, 1.40, n))      # +40% -> +26%: 14 pts < 15 allowed
+        self.assertIn("trailing stop", trail_reason(1.0, 1.25, 1.40, n))
+        self.assertIsNone(trail_reason(1.0, 1.88, 2.65, n))      # +165% -> sells at ~+88%
+        self.assertIn("trailing stop", trail_reason(1.0, 1.87, 2.65, n))
+        self.assertIsNone(exit_reason(1.0, 0.86, c0, t0, t1, None, n))
+        self.assertIn("stop loss", exit_reason(1.0, 0.85, c0, t0, t1, None, n))
         call = OptionContract("SPY", date(2026, 11, 18), "C", 600)
         put = OptionContract("SPY", date(2026, 11, 18), "P", 600)
         self.assertIn("faded", fade_reason(call, 599.0, 600.0))
@@ -432,7 +444,7 @@ class TestExitSafety(unittest.TestCase):
         import quantecho.trading.bot as botmod
         b, sent = self.bot.broker, []
         real_submit = b.submit
-        b.submit = lambda *a: (sent.append(a), real_submit(*a))[1]
+        b.submit = lambda *a, **k: (sent.append(a), real_submit(*a, **k))[1]
         from quantecho.trading.broker import OrderResult
         b.status = lambda oid, c, spot: OrderResult("working", oid)
         b.cancel = lambda oid: None                            # broker never confirms the cancel
@@ -452,7 +464,7 @@ class TestExitSafety(unittest.TestCase):
     def test_order_error_backs_off(self):
         calls = []
 
-        def boom(*a):
+        def boom(*a, **k):
             calls.append(a)
             raise RuntimeError("HTTP 422 cannot_close_against_more_than_existing_position")
         self.bot.broker.submit = boom
@@ -463,7 +475,7 @@ class TestExitSafety(unittest.TestCase):
 
     def test_no_orders_after_the_close(self):
         sent = []
-        self.bot.broker.submit = lambda *a: sent.append(a)
+        self.bot.broker.submit = lambda *a, **k: sent.append(a)
         self.pos.urgent_exit = True
         self.t.now = datetime(2026, 11, 11, 16, 30, tzinfo=NY)
         for _ in range(3):
@@ -476,6 +488,61 @@ class TestExitSafety(unittest.TestCase):
         self.bot.step()
         ex = [e for e in self.events() if e["event"] == "exit_order"]
         self.assertIn("end of day", ex[-1]["reason"])
+
+    def test_stuck_exit_falls_back_to_market_order(self):
+        """2026-11-13: the sandbox simulator never filled our modeled-price limit sells (39 tries)."""
+        import quantecho.trading.bot as botmod
+        from quantecho.trading.broker import OrderResult
+        b, kinds = self.bot.broker, []
+        real_submit = b.submit
+
+        def submit(*a, **k):
+            kinds.append(k.get("market", False))
+            return real_submit(*a, **k)
+        b.submit = submit
+        real_status = b.status
+        b.status = lambda oid, c, spot: (OrderResult("working", oid)               # limit sells never fill
+                                         if b._orders[oid]["status"] == "working" and not b._orders[oid]["market"]
+                                         else real_status(oid, c, spot))
+        self.pos.urgent_exit, self.pos.exit_why = True, "trailing stop"
+        old = botmod.EXIT_TIMEOUT_S
+        botmod.EXIT_TIMEOUT_S = -1
+        try:
+            for _ in range(6):
+                self.bot.step()
+        finally:
+            botmod.EXIT_TIMEOUT_S = old
+        self.assertEqual(kinds[:2], [False, True])          # modeled quotes: 1 limit try, then market
+        self.assertNotIn("SPY", self.bot.positions)          # ...which fills
+        with self.assertRaises(ValueError):
+            build_option_order("SPY   261116P00759000", "Buy to Open", 1, 0, "x", market=True)  # never to open
+
+    def test_percent_rules_use_modeled_basis_not_simulator_fill(self):
+        """Sandbox filled at $2.87 while our model said ~$4.20: measuring from 2.87 showed a fake +46%
+        a minute after entry and fired the trailing stop."""
+        p = self.pos
+        p.entry_price, p.basis = p.entry_price * 0.65, p.entry_price
+        self.assertAlmostEqual(p.ref, p.basis)
+        self.bot.step()
+        self.assertIn("SPY", self.bot.positions)
+        self.assertFalse(p.closing)
+        from quantecho.trading.strategy import trail_armed
+        self.assertFalse(trail_armed(p.ref, p.peak, self.bot.params))           # no fake +54% gain
+        self.assertTrue(trail_armed(p.entry_price, p.peak, self.bot.params))    # (what the old code saw)
+
+    def test_working_exit_does_not_count_as_extra_position(self):
+        """2026-11-13: an NVDA entry was blocked by max open positions (2) with only SPY held, because SPY's
+        working sell order was counted as a second position."""
+        from quantecho.trading.bot import Pending
+        self.bot.limits.max_open_positions = 2
+        self.bot.pending["x"] = Pending("exit", self.pos.contract, self.pos.qty, 1.0, "SIM-x", "x", 0.0, self.pos)
+        held = list(self.bot.positions) + [p.contract.root for p in self.bot.pending.values() if p.kind == "entry"]
+        self.assertEqual(held, ["SPY"])
+        from quantecho.chart import Signal
+        self.bot.data.bars["NVDA"] = self.bot.data.bars["SPY"]
+        self.bot._try_entry("NVDA", 580.0, Signal(5, "buy", "trend", "x"), self.t.now)
+        ev = [e for e in self.events() if e.get("symbol") == "NVDA"]
+        self.assertFalse(any("max open positions" in str(e.get("reasons", "")) for e in ev))
 
     def test_eod_rule(self):
         c = OptionContract("SPY", date(2026, 11, 20), "C", 600)   # 9 DTE

@@ -65,6 +65,7 @@ class TradingPanel(tk.Toplevel):
             "join_trend": tk.BooleanVar(value=bool(t.get("join_trend", P.join_trend_on_start))),
             "trail_arm": tk.StringVar(value=str(t.get("trail_arm", round(P.trail_arm_pct * 100)))),
             "trail_give": tk.StringVar(value=str(t.get("trail_give", round(P.trail_giveback_pct * 100)))),
+            "trail_frac": tk.StringVar(value=str(t.get("trail_frac", round(P.trail_giveback_frac * 100)))),
             "fade_exit": tk.BooleanVar(value=bool(t.get("fade_exit", P.fade_exit))),
             "close_eod": tk.BooleanVar(value=bool(t.get("close_eod", P.close_all_eod))),
             "signal_source": tk.StringVar(value=t.get("signal_source", "Trend (per symbol)")),
@@ -145,7 +146,8 @@ class TradingPanel(tk.Toplevel):
         s_tr.pack(fill="x", pady=(0, 4))
         ttk.Checkbutton(s_tr, text="Trailing stop:", variable=self.v["trailing"]).pack(side="left", padx=(8, 0))
         self._row(s_tr, "arm at +%", self.v["trail_arm"], 4)
-        self._row(s_tr, "give back %", self.v["trail_give"], 4)
+        self._row(s_tr, "give back pts", self.v["trail_give"], 3)
+        self._row(s_tr, "or % of gain", self.v["trail_frac"], 3)
         ttk.Checkbutton(s_tr, text="Sell when momentum fades", variable=self.v["fade_exit"]).pack(side="left", padx=6)
         ttk.Checkbutton(s_tr, text="Close all by 15:45", variable=self.v["close_eod"]).pack(side="left")
         s3 = ttk.Frame(strat)
@@ -202,6 +204,7 @@ class TradingPanel(tk.Toplevel):
                            join_trend_on_start=bool(self.v["join_trend"].get()),
                            trail_arm_pct=self._num("trail_arm", float, 1, 1000) / 100,
                            trail_giveback_pct=self._num("trail_give", float, 0, 100) / 100,
+                           trail_giveback_frac=self._num("trail_frac", float, 0, 100) / 100,
                            fade_exit=bool(self.v["fade_exit"].get()),
                            close_all_eod=bool(self.v["close_eod"].get()))
         if not P.min_dte <= P.target_dte <= P.max_dte:

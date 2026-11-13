@@ -31,7 +31,8 @@ NY = ZoneInfo("America/New_York")
 JOURNAL_DIR = Path.home() / ".quanteco_gpt" / "trades"
 ENTRY_TIMEOUT_S, EXIT_TIMEOUT_S = 30, 20
 EXIT_BACKOFF_S = 30        # wait after a rejected/errored exit before trying again
-CANCEL_RESEND_S = 15       # re-send a cancel the broker hasn't confirmed yet
+CANCEL_RESEND_S = 15
+MARKET_EXIT_AFTER = 3      # unfilled sells at the bid before falling back to a market order (real quotes)       # re-send a cancel the broker hasn't confirmed yet
 
 
 @dataclass
@@ -48,10 +49,18 @@ class Position:
     retry_at: float = 0.0             # monotonic time before which no new exit order is sent (backoff)
     peak: float = 0.0                 # best mark seen (for the trailing stop)
     trail_hits: int = 0               # consecutive checks past the trail (2 needed: one bad quote isn't enough)
+    exit_attempts: int = 0            # sell orders sent that didn't fill
+    basis: float = 0.0                # price the % rules measure from (see ref)
+
+    @property
+    def ref(self) -> float:
+        """Entry price on the same scale as `mark`. With modeled quotes (sandbox) the broker's simulator fills
+        at ITS price, not ours, so % gains/stops must be measured from our modeled mid at entry instead."""
+        return self.basis or self.entry_price
 
     @property
     def pnl(self) -> float:
-        return (self.mark - self.entry_price) * self.qty * 100
+        return (self.mark - self.ref) * self.qty * 100
 
     def row(self) -> Dict[str, Any]:
         return {"symbol": self.contract.symbol, "label": self.contract.label(), "qty": self.qty,
@@ -68,6 +77,7 @@ class Pending:
     ext_id: str
     placed: float
     position: Optional[Position] = None
+    basis: float = 0.0        # entry: modeled mid when the order was sent
     cancel_sent: float = 0.0  # monotonic time we asked the broker to cancel (0 = not yet)
 
 
@@ -289,7 +299,8 @@ class TradingBot:
             return
         q = self.broker.quote(c, spot)
         price = self.broker.round_price(c, entry_limit(q.bid, q.ask), buy=True)
-        open_syms = list(self.positions) + [p.contract.root for p in self.pending.values()]
+        # held positions + entries still working (a working EXIT belongs to a held position: don't count it twice)
+        open_syms = list(self.positions) + [p.contract.root for p in self.pending.values() if p.kind == "entry"]
         ok, why = check_entry(self.limits, self.state, sym, open_syms, price, q.spread_pct,
                               sum(p.pnl for p in self.positions.values()), now)
         if not ok:
@@ -301,6 +312,7 @@ class TradingBot:
         if self.confirm and not self.confirm(text):
             self.journal("declined", symbol=sym, order=text)
             return
+        basis = (q.bid + q.ask) / 2 if q.modeled else 0.0
         ext = new_external_id()
         try:
             r = self.broker.submit(c, "Buy to Open", qty, price, ext)
@@ -311,12 +323,13 @@ class TradingBot:
         self.journal("entry_order", symbol=sym, order=text, ext_id=ext, status=r.status, order_id=r.order_id,
                      message=r.message)
         if r.status == "filled":
-            self._opened(c, qty, r.fill_price or price, q.modeled, now)
+            self._opened(c, qty, r.fill_price or price, q.modeled, now, basis)
         elif r.status == "working":
-            self.pending[ext] = Pending("entry", c, qty, price, r.order_id, ext, time.monotonic())
+            self.pending[ext] = Pending("entry", c, qty, price, r.order_id, ext, time.monotonic(), basis=basis)
 
-    def _opened(self, c: OptionContract, qty: int, fill: float, modeled: bool, now: datetime) -> None:
-        self.positions[c.root] = Position(c, qty, fill, now, modeled, mark=fill)
+    def _opened(self, c: OptionContract, qty: int, fill: float, modeled: bool, now: datetime,
+                basis: float = 0.0) -> None:
+        self.positions[c.root] = Position(c, qty, fill, now, modeled, mark=basis or fill, basis=basis)
         self.journal("filled_entry", contract=c.label(), qty=qty, price=fill, cost=round(qty * fill * 100, 2))
 
     # ---------------------------------------------------------------- exits / management
@@ -338,7 +351,7 @@ class TradingBot:
         if p.urgent_exit:
             why = f"retry at bid: {p.exit_why or 'exit'}"
         else:
-            why = exit_reason(p.entry_price, p.mark, p.contract, p.opened, now, sig, self.params) \
+            why = exit_reason(p.ref, p.mark, p.contract, p.opened, now, sig, self.params) \
                 or self._dynamic_exit(p, sym)
         if why:
             self._exit(p, q, why, urgent=p.urgent_exit or why.startswith(("stop", "flatten", "kill")))
@@ -346,11 +359,11 @@ class TradingBot:
     def _dynamic_exit(self, p: Position, sym: str) -> Optional[str]:
         """Trailing stop on the premium (confirmed on 2 consecutive checks) and, once it's armed,
         a momentum-fade exit on the underlying's last closed bar."""
-        trail = trail_reason(p.entry_price, p.mark, p.peak, self.params)
+        trail = trail_reason(p.ref, p.mark, p.peak, self.params)
         p.trail_hits = p.trail_hits + 1 if trail else 0
         if trail and p.trail_hits >= 2:
             return trail
-        if self.params.fade_exit and trail_armed(p.entry_price, p.peak, self.params):
+        if self.params.fade_exit and trail_armed(p.ref, p.peak, self.params):
             bars = self._bars.get(sym) or []
             if len(bars) >= 30:
                 i = len(bars) - 2                                   # last CLOSED bar
@@ -361,16 +374,21 @@ class TradingBot:
     def _exit(self, p: Position, q, why: str, urgent: bool) -> None:
         price = self.broker.round_price(p.contract, exit_limit(q.bid, q.ask, urgent), buy=False)
         p.exit_why = p.exit_why or why
+        # A sell that keeps not filling goes out as a MARKET order: right away on retry when our prices are
+        # only modeled (the sandbox simulator fills at its own price), after a few bid retries with real quotes.
+        market = p.exit_attempts >= (1 if q.modeled else MARKET_EXIT_AFTER)
+        p.exit_attempts += 1
         ext = new_external_id()
         try:
-            r = self.broker.submit(p.contract, "Sell to Close", p.qty, price, ext)
+            r = self.broker.submit(p.contract, "Sell to Close", p.qty, price, ext, market=market)
         except Exception as e:
             p.retry_at = time.monotonic() + EXIT_BACKOFF_S          # don't hammer the broker
             self.journal("order_error", contract=p.contract.label(), action="exit", error=f"{type(e).__name__}: {e}",
                          retry_in_s=EXIT_BACKOFF_S)
             return
         p.closing = True
-        self.journal("exit_order", contract=p.contract.label(), reason=why, limit=price, status=r.status, ext_id=ext)
+        self.journal("exit_order", contract=p.contract.label(), reason=why, limit="MARKET" if market else price,
+                     status=r.status, ext_id=ext)
         if r.status == "filled":
             self._closed(p, r.fill_price or price, why)
         elif r.status == "working":
@@ -394,7 +412,7 @@ class TradingBot:
             if r.status == "filled":
                 self.pending.pop(ext)
                 if pd.kind == "entry":
-                    self._opened(pd.contract, pd.qty, r.fill_price or pd.limit, True, now)
+                    self._opened(pd.contract, pd.qty, r.fill_price or pd.limit, True, now, pd.basis)
                 else:
                     self._closed(pd.position, r.fill_price or pd.limit, pd.position.exit_why or "exit filled")
             elif r.status in ("rejected", "cancelled"):

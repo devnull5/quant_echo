@@ -31,10 +31,12 @@ class StrategyParams:
     max_dte: int = 14
     strikes_otm: int = 0                 # 0 = nearest ATM, 1 = one strike out of the money, ...
     take_profit_pct: Optional[float] = None  # fixed take-profit (None = off; the trailing stop takes profits)
-    stop_loss_pct: float = 0.05          # hard stop: -5% on premium
+    stop_loss_pct: float = 0.15          # hard stop on premium. -5% stopped out on first-minute noise in a
+                                         # 5-day SPY replay (incl. the 2026-11-13 put, -9% at 09:31 before +165%)
     trailing_stop: bool = True           # trailing stop on the premium:
     trail_arm_pct: float = 0.16          # ...arms once the premium is up this much...
-    trail_giveback_pct: float = 0.03     # ...and sells if the gain then falls this many points off its peak
+    trail_giveback_pct: float = 0.03     # ...and sells if the gain falls this many points off its peak,
+    trail_giveback_frac: float = 0.50    # ...plus this share of the gain above the arm level (lets runners run)
     fade_exit: bool = True               # once armed, also sell when the underlying closes back across EMA9
     exit_on_opposite_signal: bool = True
     flatten_at: str = "15:45"            # ET: from here on, close positions (all of them if close_all_eod)
@@ -104,16 +106,23 @@ def exit_reason(entry_price: float, mark: float, contract: OptionContract, opene
 
 
 def trail_armed(entry_price: float, peak: float, p: StrategyParams) -> bool:
-    return p.trailing_stop and p.trail_giveback_pct > 0 and entry_price > 0 and (peak - entry_price) / entry_price >= p.trail_arm_pct - 1e-9
+    return (p.trailing_stop and (p.trail_giveback_pct > 0 or p.trail_giveback_frac > 0) and entry_price > 0
+            and (peak - entry_price) / entry_price >= p.trail_arm_pct - 1e-9)
+
+
+def trail_giveback(best_gain: float, p: StrategyParams) -> float:
+    return p.trail_giveback_pct + p.trail_giveback_frac * max(0.0, best_gain - p.trail_arm_pct)
 
 
 def trail_reason(entry_price: float, mark: float, peak: float, p: StrategyParams) -> Optional[str]:
-    """Trailing stop on the option premium: armed after +trail_arm_pct, fires when the gain has dropped
-    trail_giveback_pct points below its best (e.g. ran to +15%, now +10% -> sell)."""
+    """Trailing stop on the option premium, armed after +trail_arm_pct. Allowed giveback widens as the gain
+    grows: trail_giveback_pct points + trail_giveback_frac x (peak gain - arm level). With +16% / 3 pts / 50%:
+    peaked +16% -> sell at +13%; +40% -> sell at +25%; +165% -> sell at ~+88%. Small wins are protected
+    tightly; big trend-day runs get room, and the momentum-fade exit usually takes them out sooner."""
     if not trail_armed(entry_price, peak, p):
         return None
     best, now_ = (peak - entry_price) / entry_price, (mark - entry_price) / entry_price
-    if best - now_ >= p.trail_giveback_pct - 1e-9:
+    if best - now_ >= trail_giveback(best, p) - 1e-9:
         return f"trailing stop (peaked {best:+.0%}, now {now_:+.0%})"
     return None
 

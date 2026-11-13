@@ -133,15 +133,19 @@ proven edge, so run it in SIM and sandbox for a long time before considering rea
 | `sandbox` | Real orders to tastytrade's paper environment (`api.cert.tastyworks.com`, resets daily). |
 | `live` | Real money. Refuses to start without per-order confirmation. |
 
-**Rules** (`strategy.py`): expiry nearest 7 DTE (2-14), ATM strike. Exits: **hard stop -5%** on the premium,
+**Rules** (`strategy.py`): expiry nearest 7 DTE (2-14), ATM strike. Exits: **hard stop -15%** on the premium,
 opposite trend signal, end-of-day flatten, or after 5 days. No fixed take-profit; the trailing stop takes profits.
-**Trailing stop** (checkbox, on by default): arms once the premium is up **+16%**, then sells the whole position
-if the gain drops **3 points** off its best (e.g. ran to +25%, sells at +22%; confirmed on two checks so one bad
-quote can't trigger it). While armed it also sells when the underlying closes back across EMA9 (the move is over).
+**Trailing stop** (checkbox, on by default): arms once the premium is up **+16%**; the allowed giveback is
+**3 points + 50% of the gain above +16%** (peaked +20% -> sells at +15%; +40% -> +25%; +165% -> ~+88%), confirmed
+on two checks so one bad quote can't trigger it. While armed it also sells when the underlying closes back across
+EMA9 (the move is over); on the 2026-11-13 SPY selloff that exit took a 3-DTE put out at ~+140% of a +165% peak.
 **End of day** (on by default): every position is closed from 15:45 ET, so the bot is flat overnight
 (untick "Close all by 15:45" to only flatten options expiring today/tomorrow). No orders are sent outside
 09:30-16:00 ET. An unfilled exit is cancelled and re-priced only after the broker confirms the cancel; a
-rejected exit backs off 30 s. On start the bot adopts option positions already held at the broker.
+rejected exit backs off 30 s. A sell that still won't fill goes out as a market order (after one try when prices
+are modeled, as in the sandbox whose simulator fills at its own prices; after 3 tries at the bid with real quotes).
+With modeled quotes, % rules are measured from the modeled price at entry, not the simulator's fill.
+On start the bot adopts option positions already held at the broker.
 **Join trend at start** (on by default): if no crossover has fired yet when the bot starts (or the entry
 window opens), it enters once per symbol when EMA9/EMA20 and VWAP already agree on a direction.
 **Hard limits** (`risk.py`, not overridable by the strategy): $300 max premium per trade, 2 contracts, 2 open
