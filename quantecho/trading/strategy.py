@@ -25,14 +25,19 @@ NY = ZoneInfo("America/New_York")
 class StrategyParams:
     signal_source: str = "trend"          # "trend" (per-symbol chart signals) or "confluence" (NVDA intermarket)
     use_reversal_signals: bool = False   # trend signals only by default (reversals are noisier)
+    join_trend_on_start: bool = True     # no crossover yet? enter once if a trend is already in place
     target_dte: int = 7
     min_dte: int = 2
     max_dte: int = 14
     strikes_otm: int = 0                 # 0 = nearest ATM, 1 = one strike out of the money, ...
     take_profit_pct: float = 0.50        # +50% on premium
     stop_loss_pct: float = 0.40          # -40% on premium
+    trail_arm_pct: float = 0.15          # trailing stop arms once the premium is up this much...
+    trail_giveback_pct: float = 0.05     # ...and sells if the gain then falls this many points off its peak (0 = off)
+    fade_exit: bool = True               # once armed, also sell when the underlying closes back across EMA9
     exit_on_opposite_signal: bool = True
-    flatten_at: str = "15:45"            # ET: close positions whose expiry is today or tomorrow
+    flatten_at: str = "15:45"            # ET: from here on, close positions (all of them if close_all_eod)
+    close_all_eod: bool = True           # day-trade: flat every night. Off = only options expiring today/tomorrow
     max_hold_days: int = 5
 
     def to_dict(self) -> Dict:
@@ -87,10 +92,39 @@ def exit_reason(entry_price: float, mark: float, contract: OptionContract, opene
         if against:
             return f"opposite signal ({last_signal.reason})"
     h, m = map(int, p.flatten_at.split(":"))
-    if (contract.expiry - now.date()).days <= 1 and now.time() >= dtime(h, m):
-        return "flatten before expiry"
+    if now.time() >= dtime(h, m):
+        if p.close_all_eod:
+            return f"flatten (end of day, {p.flatten_at} ET)"
+        if (contract.expiry - now.date()).days <= 1:
+            return "flatten before expiry"
     if (now.date() - opened.astimezone(NY).date()).days >= p.max_hold_days:
         return f"max hold {p.max_hold_days} days"
+    return None
+
+
+def trail_armed(entry_price: float, peak: float, p: StrategyParams) -> bool:
+    return p.trail_giveback_pct > 0 and entry_price > 0 and (peak - entry_price) / entry_price >= p.trail_arm_pct - 1e-9
+
+
+def trail_reason(entry_price: float, mark: float, peak: float, p: StrategyParams) -> Optional[str]:
+    """Trailing stop on the option premium: armed after +trail_arm_pct, fires when the gain has dropped
+    trail_giveback_pct points below its best (e.g. ran to +15%, now +10% -> sell)."""
+    if not trail_armed(entry_price, peak, p):
+        return None
+    best, now_ = (peak - entry_price) / entry_price, (mark - entry_price) / entry_price
+    if best - now_ >= p.trail_giveback_pct - 1e-9:
+        return f"trailing stop (peaked {best:+.0%}, now {now_:+.0%})"
+    return None
+
+
+def fade_reason(contract: OptionContract, close: float, ema9: Optional[float]) -> Optional[str]:
+    """The move is over: the underlying's last closed bar is back on the wrong side of EMA9."""
+    if ema9 is None:
+        return None
+    if contract.is_call and close < ema9:
+        return f"momentum faded (close {close:.2f} < EMA9 {ema9:.2f})"
+    if not contract.is_call and close > ema9:
+        return f"momentum faded (close {close:.2f} > EMA9 {ema9:.2f})"
     return None
 
 

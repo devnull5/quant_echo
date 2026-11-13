@@ -62,6 +62,11 @@ class TradingPanel(tk.Toplevel):
             "sl": tk.StringVar(value=str(int(t.get("sl", P.stop_loss_pct * 100)))),
             "opp_exit": tk.BooleanVar(value=bool(t.get("opp_exit", P.exit_on_opposite_signal))),
             "reversals": tk.BooleanVar(value=bool(t.get("reversals", P.use_reversal_signals))),
+            "join_trend": tk.BooleanVar(value=bool(t.get("join_trend", P.join_trend_on_start))),
+            "trail_arm": tk.StringVar(value=str(t.get("trail_arm", round(P.trail_arm_pct * 100)))),
+            "trail_give": tk.StringVar(value=str(t.get("trail_give", round(P.trail_giveback_pct * 100)))),
+            "fade_exit": tk.BooleanVar(value=bool(t.get("fade_exit", P.fade_exit))),
+            "close_eod": tk.BooleanVar(value=bool(t.get("close_eod", P.close_all_eod))),
             "signal_source": tk.StringVar(value=t.get("signal_source", "Trend (per symbol)")),
         }
         self.v_secret = {k: tk.StringVar(value=secret_get(k) or "") for pair in SECRETS.values() for k in pair}
@@ -136,6 +141,13 @@ class TradingPanel(tk.Toplevel):
         self._row(s2, "Stop %", self.v["sl"], 4)
         ttk.Checkbutton(s2, text="Exit on opposite signal", variable=self.v["opp_exit"]).pack(side="left", padx=6)
         ttk.Checkbutton(s2, text="+ reversals", variable=self.v["reversals"]).pack(side="left")
+        ttk.Checkbutton(s2, text="Join trend at start", variable=self.v["join_trend"]).pack(side="left", padx=6)
+        s_tr = ttk.Frame(strat)
+        s_tr.pack(fill="x", pady=(0, 4))
+        self._row(s_tr, "Trail after +%", self.v["trail_arm"], 4)
+        self._row(s_tr, "give back %", self.v["trail_give"], 4)
+        ttk.Checkbutton(s_tr, text="Sell when momentum fades", variable=self.v["fade_exit"]).pack(side="left", padx=6)
+        ttk.Checkbutton(s_tr, text="Close all by 15:45", variable=self.v["close_eod"]).pack(side="left")
         s3 = ttk.Frame(strat)
         s3.pack(fill="x")
         ttk.Label(s3, text="Signal source", style="Muted.TLabel").pack(side="left", padx=(8, 3))
@@ -186,7 +198,12 @@ class TradingPanel(tk.Toplevel):
                            exit_on_opposite_signal=bool(self.v["opp_exit"].get()),
                            signal_source="confluence" if str(self.v["signal_source"].get()).startswith("NVDA")
                            else "trend",
-                           use_reversal_signals=bool(self.v["reversals"].get()))
+                           use_reversal_signals=bool(self.v["reversals"].get()),
+                           join_trend_on_start=bool(self.v["join_trend"].get()),
+                           trail_arm_pct=self._num("trail_arm", float, 1, 1000) / 100,
+                           trail_giveback_pct=self._num("trail_give", float, 0, 100) / 100,
+                           fade_exit=bool(self.v["fade_exit"].get()),
+                           close_all_eod=bool(self.v["close_eod"].get()))
         if not P.min_dte <= P.target_dte <= P.max_dte:
             raise ValueError("DTE must satisfy Min <= Target <= Max")
         if P.signal_source == "confluence" and "NVDA" not in L.allowed_symbols:

@@ -21,13 +21,16 @@ from ..logsetup import log
 from ..telemetry import is_rth
 from .broker import Broker
 from .occ import OptionContract
-from .risk import DayState, RiskLimits, check_entry, size_position
-from .strategy import (StrategyParams, entry_limit, entry_side, exit_limit, exit_reason, pick_contract)
+from .risk import DayState, RiskLimits, check_entry, in_entry_window, market_open, size_position
+from .strategy import (StrategyParams, entry_limit, entry_side, exit_limit, exit_reason, fade_reason, pick_contract,
+                       trail_armed, trail_reason)
 from .tasty import new_external_id
 
 NY = ZoneInfo("America/New_York")
 JOURNAL_DIR = Path.home() / ".quanteco_gpt" / "trades"
 ENTRY_TIMEOUT_S, EXIT_TIMEOUT_S = 30, 20
+EXIT_BACKOFF_S = 30        # wait after a rejected/errored exit before trying again
+CANCEL_RESEND_S = 15       # re-send a cancel the broker hasn't confirmed yet
 
 
 @dataclass
@@ -40,6 +43,10 @@ class Position:
     mark: float = 0.0
     closing: bool = False
     urgent_exit: bool = False
+    exit_why: str = ""                # why we first decided to sell (kept across retries)
+    retry_at: float = 0.0             # monotonic time before which no new exit order is sent (backoff)
+    peak: float = 0.0                 # best mark seen (for the trailing stop)
+    trail_hits: int = 0               # consecutive checks past the trail (2 needed: one bad quote isn't enough)
 
     @property
     def pnl(self) -> float:
@@ -60,6 +67,7 @@ class Pending:
     ext_id: str
     placed: float
     position: Optional[Position] = None
+    cancel_sent: float = 0.0  # monotonic time we asked the broker to cancel (0 = not yet)
 
 
 @dataclass
@@ -92,6 +100,8 @@ class TradingBot:
         self._bars: Dict[str, List[Dict[str, Any]]] = {}
         self._bars_at: Dict[str, float] = {}
         self._seen_signal_t: Dict[str, int] = {}
+        self._joined: set = set()             # symbols already checked for 'join the trend at start'
+        self._closed_note = None              # date we last journaled 'market closed'
         self._last_sig: Dict[str, Optional[Signal]] = {}
         self.rule = ConfluenceRule()
         self._confl_seen_t: Optional[int] = None
@@ -146,6 +156,23 @@ class TradingBot:
                 break
         return None
 
+    def _trend_in_place(self, sym: str, bars: List[Dict[str, Any]]) -> Optional[Signal]:
+        """Once per symbol per run: if no crossover has fired yet but a trend is already established on the
+        bar that just closed (EMA9 vs EMA20 and price vs VWAP agree), return a trend signal to join it."""
+        if len(bars) < 30:
+            return None
+        self._joined.add(sym)
+        i = len(bars) - 2
+        s = compute_series(bars, [is_rth(b["t"]) for b in bars])
+        e9, e20, vw, c = s.ema9[i], s.ema20[i], s.vwap[i], bars[i]["close"]
+        if None in (e9, e20):
+            return None
+        if e9 > e20 and (vw is None or c > vw):
+            return Signal(i, "buy", "trend", "already in an uptrend at start (EMA9 > EMA20, price above VWAP)")
+        if e9 < e20 and (vw is None or c < vw):
+            return Signal(i, "sell", "trend", "already in a downtrend at start (EMA9 < EMA20, price below VWAP)")
+        return None
+
     def _new_confluence_signal(self) -> Optional[Signal]:
         """Confluence signal on the minute that JUST closed (all legs aligned), reported once."""
         series = {}
@@ -188,6 +215,11 @@ class TradingBot:
                     sig = confl_sig if sym == self.rule.target else None   # only the target trades
                 else:
                     sig = self._new_signal(sym, bars)
+                    if sig:
+                        self._joined.add(sym)          # a real crossover came first; don't also 'join'
+                    elif (self.params.join_trend_on_start and sym not in self._joined
+                          and in_entry_window(self.limits, now)):
+                        sig = self._trend_in_place(sym, bars)
                 if sig:
                     self._last_sig[sym] = sig
                     self.journal("signal", symbol=sym, side=sig.side, kind=sig.kind, reason=sig.reason, spot=spot)
@@ -203,6 +235,8 @@ class TradingBot:
     def _try_entry(self, sym: str, spot: float, sig: Signal, now: datetime) -> None:
         right = entry_side(sig, self.params)
         if right is None:
+            self.journal("skip", symbol=sym, reason=f"{sig.kind} signals are off "
+                         "(tick '+ reversals' to trade them)")
             return
         c = pick_contract(sym, self.broker.chain(sym, spot), spot, right, now.date(), self.params)
         if c is None:
@@ -247,18 +281,48 @@ class TradingBot:
             return
         q = self.broker.quote(p.contract, spot)
         p.mark = (q.bid + q.ask) / 2
-        why = "kill switch" if p.urgent_exit else exit_reason(p.entry_price, p.mark, p.contract, p.opened, now, sig,
-                                                              self.params)
+        p.peak = max(p.peak, p.mark)
+        if not market_open(now):
+            if self._closed_note != now.date():
+                self._closed_note = now.date()
+                self.journal("market_closed", note="no orders outside 09:30-16:00 ET; holding until the next open",
+                             holding=[x.contract.label() for x in self.positions.values()])
+            return
+        if time.monotonic() < p.retry_at:
+            return
+        if p.urgent_exit:
+            why = f"retry at bid: {p.exit_why or 'exit'}"
+        else:
+            why = exit_reason(p.entry_price, p.mark, p.contract, p.opened, now, sig, self.params) \
+                or self._dynamic_exit(p, sym)
         if why:
             self._exit(p, q, why, urgent=p.urgent_exit or why.startswith(("stop", "flatten", "kill")))
 
+    def _dynamic_exit(self, p: Position, sym: str) -> Optional[str]:
+        """Trailing stop on the premium (confirmed on 2 consecutive checks) and, once it's armed,
+        a momentum-fade exit on the underlying's last closed bar."""
+        trail = trail_reason(p.entry_price, p.mark, p.peak, self.params)
+        p.trail_hits = p.trail_hits + 1 if trail else 0
+        if trail and p.trail_hits >= 2:
+            return trail
+        if self.params.fade_exit and trail_armed(p.entry_price, p.peak, self.params):
+            bars = self._bars.get(sym) or []
+            if len(bars) >= 30:
+                i = len(bars) - 2                                   # last CLOSED bar
+                s = compute_series(bars, [is_rth(b["t"]) for b in bars])
+                return fade_reason(p.contract, bars[i]["close"], s.ema9[i])
+        return None
+
     def _exit(self, p: Position, q, why: str, urgent: bool) -> None:
         price = self.broker.round_price(p.contract, exit_limit(q.bid, q.ask, urgent), buy=False)
+        p.exit_why = p.exit_why or why
         ext = new_external_id()
         try:
             r = self.broker.submit(p.contract, "Sell to Close", p.qty, price, ext)
         except Exception as e:
-            self.journal("order_error", contract=p.contract.label(), action="exit", error=f"{type(e).__name__}: {e}")
+            p.retry_at = time.monotonic() + EXIT_BACKOFF_S          # don't hammer the broker
+            self.journal("order_error", contract=p.contract.label(), action="exit", error=f"{type(e).__name__}: {e}",
+                         retry_in_s=EXIT_BACKOFF_S)
             return
         p.closing = True
         self.journal("exit_order", contract=p.contract.label(), reason=why, limit=price, status=r.status, ext_id=ext)
@@ -291,12 +355,21 @@ class TradingBot:
                 self.journal(f"{pd.kind}_{r.status}", contract=pd.contract.label(), message=r.message)
                 if pd.position:
                     pd.position.closing = False
-            elif time.monotonic() - pd.placed > (ENTRY_TIMEOUT_S if pd.kind == "entry" else EXIT_TIMEOUT_S):
+                    if pd.cancel_sent:                       # our timeout: re-price at the bid next step
+                        pd.position.urgent_exit = True
+                    else:                                    # broker rejected it: back off before retrying
+                        pd.position.retry_at = time.monotonic() + EXIT_BACKOFF_S
+            elif pd.cancel_sent:
+                # Cancel is asynchronous at the broker: wait until it's confirmed (or filled) before re-pricing,
+                # otherwise the new order is rejected ("already have a closing order") or we double up.
+                if time.monotonic() - pd.cancel_sent > CANCEL_RESEND_S:
+                    self.broker.cancel(pd.order_id)
+                    pd.cancel_sent = time.monotonic()
+            elif (time.monotonic() - pd.placed > (ENTRY_TIMEOUT_S if pd.kind == "entry" else EXIT_TIMEOUT_S)
+                  or not market_open(now)):
                 self.broker.cancel(pd.order_id)
-                self.pending.pop(ext)
-                self.journal(f"{pd.kind}_timeout_cancelled", contract=pd.contract.label(), limit=pd.limit)
-                if pd.position:   # exit didn't fill: retry next step at the bid
-                    pd.position.closing, pd.position.urgent_exit = False, True
+                pd.cancel_sent = time.monotonic()
+                self.journal(f"{pd.kind}_timeout_cancel_requested", contract=pd.contract.label(), limit=pd.limit)
 
     # ---------------------------------------------------------------- kill switch
     def kill(self) -> None:
@@ -323,6 +396,7 @@ class TradingBot:
             return
         self._stop.clear()
         L, P = self.limits, self.params
+        self._adopt_positions()
         self.journal("bot_started", broker=self.broker.name, symbols=" ".join(L.allowed_symbols),
                      rules=(f"${L.max_premium_per_trade:,.0f}/trade, max {L.max_contracts_per_trade} contracts, "
                             f"{L.max_open_positions} open, daily loss ${L.daily_loss_limit:,.0f}; {P.target_dte} DTE "
@@ -340,6 +414,24 @@ class TradingBot:
                 self._stop.wait(every_s)
         self.thread = threading.Thread(target=run, daemon=True, name="quantecho-bot")
         self.thread.start()
+
+    def _adopt_positions(self) -> None:
+        """Pick up options already held at the broker (e.g. after a restart) so exits and the end-of-day
+        flatten still manage them. Entry time is unknown, so it's treated as now."""
+        try:
+            held = self.broker.open_positions(self.limits.allowed_symbols)
+        except Exception as e:
+            self.journal("adopt_error", error=f"{type(e).__name__}: {e}")
+            return
+        now = self.clock()
+        with self._lock:
+            for c, qty, avg in held:
+                if c.root in self.positions:
+                    if self.positions[c.root].contract.symbol != c.symbol:
+                        self.journal("adopt_skipped", contract=c.label(), reason=f"already managing a {c.root} position")
+                    continue
+                self.positions[c.root] = Position(c, qty, avg, now, False, mark=avg)
+                self.journal("adopted", contract=c.label(), qty=qty, entry=avg)
 
     def stop(self) -> None:
         self._stop.set()

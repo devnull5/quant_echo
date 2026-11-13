@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..logsetup import log
 from .occ import OptionContract, parse_occ
@@ -39,6 +39,10 @@ class Broker:
     def submit(self, c: OptionContract, action: str, qty: int, limit: float, ext_id: str) -> OrderResult: ...
     def status(self, order_id: str, c: OptionContract, spot: float) -> OrderResult: ...
     def cancel(self, order_id: str) -> None: ...
+
+    def open_positions(self, allowed: List[str]) -> List[Tuple[OptionContract, int, float]]:
+        """Long option positions already held at the broker: (contract, qty, avg open price)."""
+        return []
 
 
 class SimBroker(Broker):
@@ -188,6 +192,16 @@ class TastyBroker(Broker):
             self.client.cancel(order_id)
         except Exception as e:
             log.warning(f"tastytrade cancel {order_id} failed: {e}")
+
+    def open_positions(self, allowed: List[str]) -> List[Tuple[OptionContract, int, float]]:
+        out = []
+        for p in positions_for(self.client, allowed):
+            if str(p.get("quantity-direction", "Long")).lower() != "long":
+                continue
+            qty = int(float(p.get("quantity") or 0))
+            if qty > 0:
+                out.append((parse_occ(p["symbol"]), qty, float(p.get("average-open-price") or 0)))
+        return out
 
 
 def positions_for(client: TastytradeClient, allowed: List[str]) -> List[Dict[str, Any]]:

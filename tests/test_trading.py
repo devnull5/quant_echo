@@ -179,9 +179,10 @@ class TestPricingRiskStrategy(unittest.TestCase):
         L, st = RiskLimits(), DayState()
         wed11 = datetime(2026, 11, 11, 11, 0, tzinfo=NY)
         self.assertEqual(check_entry(L, st, "SPY", [], 1.0, 0.02, 0, wed11), (True, []))
-        ok, why = check_entry(L, st, "TSLA", [], 1.0, 0.02, 0, datetime(2026, 11, 11, 9, 35, tzinfo=NY))
+        ok, why = check_entry(L, st, "TSLA", [], 1.0, 0.02, 0, datetime(2026, 11, 11, 9, 29, tzinfo=NY))
         self.assertFalse(ok)
         self.assertTrue(any("allowlist" in w for w in why) and any("entry window" in w for w in why))
+        self.assertTrue(check_entry(L, st, "SPY", [], 1.0, 0.02, 0, datetime(2026, 11, 11, 9, 30, tzinfo=NY))[0])  # open
         self.assertFalse(check_entry(L, st, "SPY", ["SPY"], 1.0, 0.02, 0, wed11)[0])           # already holding
         self.assertFalse(check_entry(L, st, "SPY", [], 5.0, 0.02, 0, wed11)[0])                # $500 > $300
         self.assertFalse(check_entry(L, st, "SPY", [], 1.0, 0.20, 0, wed11)[0])                # wide spread
@@ -238,11 +239,11 @@ class TestBotEndToEnd(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def make(self, **kw):
+    def make(self, params=None, bars=None, **kw):
         from quantecho.trading.bot import TradingBot
-        self.data = FakeData(self.bars)
+        self.data = FakeData(bars if bars is not None else self.bars)
         limits = RiskLimits(max_premium_per_trade=1200)   # a 7-DTE ATM SPY call models at ~$5 (~$500/contract)
-        return TradingBot(SimBroker(), self.data, limits, StrategyParams(), queue.Queue(),
+        return TradingBot(SimBroker(), self.data, limits, params or StrategyParams(), queue.Queue(),
                           journal_dir=Path(self.tmp.name), clock=lambda: self.now, bars_every_s=0, **kw)
 
     def test_signal_entry_fill_takeprofit_journal(self):
@@ -303,6 +304,171 @@ class TestBotEndToEnd(unittest.TestCase):
         bot = self.make()
         bot.step()
         self.assertEqual((len(bot.pending), len(bot.positions)), (0, 0))
+
+
+class TestJoinTrendOnStart(unittest.TestCase):
+    """Started after the crossover: the bot joins an established trend once, inside the entry window."""
+    make, tearDown = TestBotEndToEnd.make, TestBotEndToEnd.tearDown
+
+    def setUp(self):
+        TestBotEndToEnd.setUp(self)
+        closes = [580.0] * 30 + [580 - (i + 1) * 0.2 for i in range(12)]
+        closes += [closes[-1] + (i + 1) * 0.3 for i in range(30)]
+        self.late = rth_bars(closes)                 # crossover is ~10+ bars back; nothing fires on the last bar
+
+    def test_joins_uptrend_once(self):
+        bot = self.make(bars=self.late)
+        bot.step()
+        self.assertEqual(len(bot.pending), 1)
+        self.assertTrue(next(iter(bot.pending.values())).contract.is_call)
+        self.assertIn("already in an uptrend", bot._last_sig["SPY"].reason)
+        bot.step()                                   # fills
+        self.assertIn("SPY", bot.positions)
+        # only one join per run:
+        bot.positions.clear(); bot.pending.clear()
+        bot.step()
+        self.assertFalse(bot.pending)
+
+    def test_off_waits_for_crossover(self):
+        bot = self.make(params=StrategyParams(join_trend_on_start=False), bars=self.late)
+        bot.step()
+        self.assertFalse(bot.pending)
+
+    def test_waits_for_entry_window(self):
+        bot = self.make(bars=self.late)
+        self.now = datetime(2026, 11, 11, 9, 0, tzinfo=NY)
+        bot.step()
+        self.assertFalse(bot.pending)                # pre-market: not used up
+        self.now = datetime(2026, 11, 11, 11, 0, tzinfo=NY)
+        bot.step()
+        self.assertEqual(len(bot.pending), 1)
+
+
+class TestDynamicExit(unittest.TestCase):
+    def test_trail_and_fade_rules(self):
+        from quantecho.trading.strategy import fade_reason, trail_armed, trail_reason
+        p = StrategyParams()                                     # arm +15%, give back 5 points
+        self.assertFalse(trail_armed(1.0, 1.14, p))
+        self.assertIsNone(trail_reason(1.0, 1.05, 1.14, p))     # never armed -> the plain stop handles it
+        self.assertIsNone(trail_reason(1.0, 1.11, 1.15, p))     # +15% -> +11%: within 5 points
+        self.assertIn("trailing stop", trail_reason(1.0, 1.10, 1.15, p))
+        self.assertIn("trailing stop", trail_reason(1.0, 1.35, 1.40, p))   # ratchets with the peak
+        self.assertIsNone(trail_reason(1.0, 1.0, 1.5, StrategyParams(trail_giveback_pct=0)))  # off
+        call = OptionContract("SPY", date(2026, 11, 18), "C", 600)
+        put = OptionContract("SPY", date(2026, 11, 18), "P", 600)
+        self.assertIn("faded", fade_reason(call, 599.0, 600.0))
+        self.assertIsNone(fade_reason(call, 601.0, 600.0))
+        self.assertIn("faded", fade_reason(put, 601.0, 600.0))
+        self.assertIsNone(fade_reason(put, 601.0, None))
+
+    def test_bot_trails_after_two_confirmations(self):
+        from types import SimpleNamespace
+        t = TestBotEndToEnd()
+        t.setUp()
+        try:
+            bot = t.make()
+            bot.step(); bot.step()                               # enter + fill
+            pos = bot.positions["SPY"]
+            e = pos.entry_price
+            mark = {"m": e * 1.20}
+            bot.broker.quote = lambda c, spot: SimpleNamespace(bid=mark["m"] - 0.01, ask=mark["m"] + 0.01,
+                                                               modeled=True)
+            bot.step()                                           # +20%: armed, holding
+            self.assertFalse(pos.closing)
+            mark["m"] = e * 1.12
+            bot.step()                                           # 8 points off the peak: 1st confirmation
+            self.assertFalse(pos.closing)
+            bot.step()                                           # 2nd -> sell
+            self.assertTrue(pos.closing)
+            lines = (Path(t.tmp.name) / "2026-11-11.jsonl").read_text().splitlines()
+            ex = [json.loads(x) for x in lines if '"exit_order"' in x]
+            self.assertIn("trailing stop", ex[-1]["reason"])
+        finally:
+            t.tearDown()
+
+
+class TestExitSafety(unittest.TestCase):
+    """Regressions from the 2026-11-12 sandbox run: an unfilled exit was cancelled and re-sent every ~27 s
+    for hours (incl. after the close), each new order rejected because the old cancel hadn't landed."""
+    def setUp(self):
+        self.t = TestBotEndToEnd()
+        self.t.setUp()
+        self.bot = self.t.make()
+        self.bot.step(); self.bot.step()                      # enter + fill
+        self.pos = self.bot.positions["SPY"]
+
+    def tearDown(self):
+        self.t.tearDown()
+
+    def events(self):
+        lines = (Path(self.t.tmp.name) / "2026-11-11.jsonl").read_text().splitlines()
+        return [json.loads(x) for x in lines]
+
+    def test_waits_for_cancel_confirmation_before_resending(self):
+        import quantecho.trading.bot as botmod
+        b, sent = self.bot.broker, []
+        real_submit = b.submit
+        b.submit = lambda *a: (sent.append(a), real_submit(*a))[1]
+        from quantecho.trading.broker import OrderResult
+        b.status = lambda oid, c, spot: OrderResult("working", oid)
+        b.cancel = lambda oid: None                            # broker never confirms the cancel
+        self.pos.urgent_exit, self.pos.exit_why = True, "stop loss (-45%)"
+        old = botmod.EXIT_TIMEOUT_S
+        botmod.EXIT_TIMEOUT_S = 0
+        try:
+            for _ in range(6):
+                self.bot.step()
+        finally:
+            botmod.EXIT_TIMEOUT_S = old
+        self.assertEqual(len(sent), 1)                         # one exit order, no spam
+        ev = self.events()
+        self.assertTrue(any(e["event"] == "exit_timeout_cancel_requested" for e in ev))
+        self.assertIn("stop loss", [e for e in ev if e["event"] == "exit_order"][-1]["reason"])
+
+    def test_order_error_backs_off(self):
+        calls = []
+
+        def boom(*a):
+            calls.append(a)
+            raise RuntimeError("HTTP 422 cannot_close_against_more_than_existing_position")
+        self.bot.broker.submit = boom
+        self.pos.urgent_exit, self.pos.exit_why = True, "kill switch"
+        for _ in range(5):
+            self.bot.step()
+        self.assertEqual(len(calls), 1)
+
+    def test_no_orders_after_the_close(self):
+        sent = []
+        self.bot.broker.submit = lambda *a: sent.append(a)
+        self.pos.urgent_exit = True
+        self.t.now = datetime(2026, 11, 11, 16, 30, tzinfo=NY)
+        for _ in range(3):
+            self.bot.step()
+        self.assertEqual(sent, [])
+        self.assertEqual(sum(e["event"] == "market_closed" for e in self.events()), 1)
+
+    def test_flatten_everything_at_1545(self):
+        self.t.now = datetime(2026, 11, 11, 15, 46, tzinfo=NY)
+        self.bot.step()
+        ex = [e for e in self.events() if e["event"] == "exit_order"]
+        self.assertIn("end of day", ex[-1]["reason"])
+
+    def test_eod_rule(self):
+        c = OptionContract("SPY", date(2026, 11, 20), "C", 600)   # 9 DTE
+        t0, late = datetime(2026, 11, 11, 10, tzinfo=NY), datetime(2026, 11, 11, 15, 46, tzinfo=NY)
+        self.assertIn("end of day", exit_reason(1.0, 1.0, c, t0, late, None, StrategyParams()))
+        self.assertIsNone(exit_reason(1.0, 1.0, c, t0, late, None, StrategyParams(close_all_eod=False)))
+
+    def test_adopts_broker_positions_on_start(self):
+        from quantecho.trading.bot import TradingBot
+        c = OptionContract("NVDA", date(2026, 11, 16), "C", 165)
+        b = SimBroker()
+        b.open_positions = lambda allowed: [(c, 2, 3.4)]
+        bot = TradingBot(b, FakeData({"SPY": [], "NVDA": []}), RiskLimits(), StrategyParams(), queue.Queue(),
+                         journal_dir=Path(self.t.tmp.name), clock=lambda: self.t.now, bars_every_s=0)
+        bot._adopt_positions()
+        self.assertEqual(bot.positions["NVDA"].qty, 2)
+        self.assertEqual(bot.positions["NVDA"].entry_price, 3.4)
 
 
 class TestBotConfluence(unittest.TestCase):

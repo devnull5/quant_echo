@@ -135,9 +135,18 @@ proven edge, so run it in SIM and sandbox for a long time before considering rea
 
 **Rules** (`strategy.py`): expiry nearest 7 DTE (2-14), ATM strike; exit at +50% / -40%, on the opposite trend
 signal, before expiry (15:45 ET when expiring today/tomorrow) or after 5 days.
+**Dynamic exit** (on by default): once the premium is up +15% a trailing stop arms and sells if the gain
+falls 5 points off its best (e.g. ran to +30%, sells at +25%; confirmed on two checks so one bad quote can't
+trigger it). While armed it also sells when the underlying closes back across EMA9 (the move is over).
+**End of day** (on by default): every position is closed from 15:45 ET, so the bot is flat overnight
+(untick "Close all by 15:45" to only flatten options expiring today/tomorrow). No orders are sent outside
+09:30-16:00 ET. An unfilled exit is cancelled and re-priced only after the broker confirms the cancel; a
+rejected exit backs off 30 s. On start the bot adopts option positions already held at the broker.
+**Join trend at start** (on by default): if no crossover has fired yet when the bot starts (or the entry
+window opens), it enters once per symbol when EMA9/EMA20 and VWAP already agree on a direction.
 **Hard limits** (`risk.py`, not overridable by the strategy): $300 max premium per trade, 2 contracts, 2 open
 positions, one per symbol, $300 daily loss limit (halts entries), 6 entries/day, max 10% bid/ask spread,
-entries only 09:45-15:30 ET on weekdays. **Kill switch** cancels working orders, sells everything at the bid
+entries only 09:30-15:30 ET on weekdays. **Kill switch** cancels working orders, sells everything at the bid
 and halts for the day.
 **Order safety** (`tasty.py`): limit orders only; every order is **dry-run first** (any warning blocks it);
 a unique `external-identifier` per order, and a timed-out submit is looked up, **never blindly resent**.
