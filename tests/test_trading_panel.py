@@ -45,6 +45,8 @@ class TestTradingPanel(unittest.TestCase):
                                      first_run_done=True, ask_source_on_launch=False, ai_backend="ollama")
         self.patches = [mock.patch.object(gui, "load_settings", return_value=self.settings),
                         mock.patch.object(gui, "save_settings", return_value=[]),
+                        mock.patch("quantecho.trading.live_iv.yahoo_index_levels",   # offline
+                                   return_value={"^VIX": 20.0, "^VIX9D": 19.0, "^VXN": 24.0}),
                         mock.patch.object(gui.llm, "preload"),
                         mock.patch.object(gui.llm, "list_models", return_value=[])]
         for p in self.patches:

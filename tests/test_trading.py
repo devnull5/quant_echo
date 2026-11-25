@@ -566,6 +566,42 @@ class TestExitSafety(unittest.TestCase):
         self.assertEqual(bot.positions["NVDA"].entry_price, 3.4)
 
 
+class TestLiveIV(unittest.TestCase):
+    def test_index_mapping_and_refresh(self):
+        from quantecho.trading.live_iv import LiveIV, ivs_from_indexes
+        v = ivs_from_indexes({"^VIX": 30.71, "^VIX9D": 26.68, "^VXN": 36.42})     # 2026-11-25
+        self.assertAlmostEqual(v["SPY"], 0.3071)
+        self.assertAlmostEqual(v["QQQ"], 0.3642)
+        self.assertAlmostEqual(v["NVDA"], 1.8 * 0.3642)
+        self.assertEqual(ivs_from_indexes({"^VXN": 10})["NVDA"], 0.45)          # floor
+        t, calls = [0.0], []
+
+        def fetch():
+            calls.append(1)
+            if len(calls) == 2:
+                raise ConnectionError("down")
+            return {"^VIX": 20.0 + len(calls)}
+        iv = LiveIV(fetch, refresh_s=300, clock=lambda: t[0])
+        self.assertAlmostEqual(iv.get("SPY"), 0.21)
+        iv.get("SPY")
+        self.assertEqual(len(calls), 1)                      # cached
+        t[0] = 301
+        self.assertAlmostEqual(iv.get("spy"), 0.21)          # refresh failed -> keeps last good value
+        t[0] = 700
+        self.assertAlmostEqual(iv.get("SPY"), 0.23)
+        self.assertIsNone(iv.get("TSLA"))                    # unknown -> model falls back to its default
+
+    def test_stressed_iv_prices_puts_like_the_market(self):
+        """2026-11-25: modeled at the fixed 16% IV the 0-DTE SPY 705P cost $1.33; at VIX-level IV it's ~2x+."""
+        from quantecho.trading.live_iv import LiveIV
+        c = OptionContract("SPY", date(2026, 11, 25), "P", 705)
+        now = datetime(2026, 11, 25, 7, 52, tzinfo=NY)
+        fixed = SimBroker()
+        live = SimBroker(iv=LiveIV(lambda: {"^VIX": 30.71, "^VIX9D": 26.68, "^VXN": 36.42}))
+        fixed.clock = live.clock = lambda: now
+        self.assertGreater(live.quote(c, 705.0).mark, 1.8 * fixed.quote(c, 705.0).mark)
+
+
 class TestBotConfluence(unittest.TestCase):
     def test_confluence_buys_nvda_call_only(self):
         import sys

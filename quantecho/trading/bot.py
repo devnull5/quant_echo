@@ -464,7 +464,9 @@ class TradingBot:
         self._stop.clear()
         L, P = self.limits, self.params
         self._adopt_positions()
+        snap = getattr(self.broker.iv, "snapshot", None) if hasattr(self.broker, "iv") else None
         self.journal("bot_started", broker=self.broker.name, symbols=" ".join(L.allowed_symbols),
+                     model_iv=(snap() if snap else None),
                      rules=(f"${L.max_premium_per_trade:,.0f}/trade, max {L.max_contracts_per_trade} contracts, "
                             f"{L.max_open_positions} open, daily loss ${L.daily_loss_limit:,.0f}; {P.target_dte} DTE "
                             f"({P.min_dte}-{P.max_dte}), SL -{P.stop_loss_pct:.0%}"

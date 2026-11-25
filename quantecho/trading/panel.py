@@ -246,12 +246,13 @@ class TradingPanel(tk.Toplevel):
 
     def _make_broker(self, mode: str):
         from .broker import SimBroker, TastyBroker
+        from .live_iv import LiveIV
         quote_client = None
         if self.v["prod_quotes"].get() and mode in ("sim", "sandbox"):
             quote_client = self._client("live")
         if mode == "sim":
-            return SimBroker(quote_client=quote_client)    # local fills; real quotes if configured
-        return TastyBroker(self._client(mode), quote_client=quote_client)
+            return SimBroker(quote_client=quote_client, iv=LiveIV())   # local fills; real quotes if configured
+        return TastyBroker(self._client(mode), quote_client=quote_client, iv=LiveIV())   # IV for modeled prices
 
     def _data_provider(self):
         from ..providers import PROVIDERS, create

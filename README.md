@@ -170,6 +170,10 @@ application and a grant at my.tastytrade.com (Manage → My Profile → API) to 
 **refresh token**. The sandbox needs its own sandbox account and credentials (developer.tastytrade.com/sandbox).
 The sandbox's market data is static placeholder values (not real prices), so sandbox mode uses modeled
 prices to choose limits unless you also provide read-only production credentials for real quotes.
+Modeled prices (SIM and sandbox) use live implied volatility from the CBOE indices, refreshed every 5 min:
+SPY = max(VIX, VIX9D), QQQ = VXN, NVDA = max(45%, 1.8 x VXN) (`trading/live_iv.py`). These are 30-day,
+at-the-money numbers, so short-dated (0-2 DTE) options on stressed days still come out cheaper than the market;
+only real quotes fix that.
 Limit prices are rounded to each underlying's tick sizes from the chain (e.g. NVDA options: $0.05 at/above
 $3, $0.01 below).
 
