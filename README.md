@@ -141,7 +141,7 @@ on two checks so one bad quote can't trigger it. While armed it also sells when 
 EMA9 (the move is over); on the 2026-11-13 SPY selloff that exit took a 3-DTE put out at ~+140% of a +165% peak.
 **End of day** (on by default): every position is closed from 15:45 ET, so the bot is flat overnight
 (untick "Close all by 15:45" to only flatten options expiring today/tomorrow). No orders are sent outside
-09:30-16:00 ET. An unfilled exit is cancelled and re-priced only after the broker confirms the cancel; a
+07:30-16:00 ET ("Trade from" in the panel). An unfilled exit is cancelled and re-priced only after the broker confirms the cancel; a
 rejected exit backs off 30 s. A sell that still won't fill goes out as a market order (after one try when prices
 are modeled, as in the sandbox whose simulator fills at its own prices; after 3 tries at the bid with real quotes).
 With modeled quotes, % rules are measured from the modeled price at entry, not the simulator's fill.
@@ -150,7 +150,7 @@ On start the bot adopts option positions already held at the broker.
 window opens), it enters once per symbol when EMA9/EMA20 and VWAP already agree on a direction.
 **Hard limits** (`risk.py`, not overridable by the strategy): $300 max premium per trade, 2 contracts, 2 open
 positions, one per symbol, $300 daily loss limit (halts entries), 6 entries/day, max 10% bid/ask spread,
-entries only 09:30-15:30 ET on weekdays. **Kill switch** cancels working orders, sells everything at the bid
+entries only 07:30-15:30 ET on weekdays (pre-market option trading; set "Trade from" to change). **Kill switch** cancels working orders, sells everything at the bid
 and halts for the day.
 **Order safety** (`tasty.py`): limit orders only; every order is **dry-run first** (any warning blocks it);
 a unique `external-identifier` per order, and a timed-out submit is looked up, **never blindly resent**.

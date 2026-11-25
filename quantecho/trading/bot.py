@@ -103,6 +103,8 @@ class TradingBot:
         if broker.real_money and confirm is None:
             raise ValueError("LIVE trading requires per-order confirmation (confirm callback)")
         self.broker, self.data, self.limits, self.params = broker, data, limits, params
+        if broker.clock is None:
+            broker.clock = clock          # modeled prices/expiries follow the bot's clock (tests, replays)
         self.events, self.mode, self.confirm, self.clock = events, mode, confirm, clock
         self.journal_dir = journal_dir if journal_dir is not None else JOURNAL_DIR   # resolved at runtime
         self.bars_every_s = bars_every_s
@@ -340,10 +342,10 @@ class TradingBot:
         q = self.broker.quote(p.contract, spot)
         p.mark = (q.bid + q.ask) / 2
         p.peak = max(p.peak, p.mark)
-        if not market_open(now):
+        if not market_open(now, self.limits.entry_start):
             if self._closed_note != now.date():
                 self._closed_note = now.date()
-                self.journal("market_closed", note="no orders outside 09:30-16:00 ET; holding until the next open",
+                self.journal("market_closed", note=f"no orders outside {self.limits.entry_start}-16:00 ET; holding until the next session",
                              holding=[x.contract.label() for x in self.positions.values()])
             return
         if time.monotonic() < p.retry_at:
@@ -431,7 +433,7 @@ class TradingBot:
                     self.broker.cancel(pd.order_id)
                     pd.cancel_sent = time.monotonic()
             elif (time.monotonic() - pd.placed > (ENTRY_TIMEOUT_S if pd.kind == "entry" else EXIT_TIMEOUT_S)
-                  or not market_open(now)):
+                  or not market_open(now, self.limits.entry_start)):
                 self.broker.cancel(pd.order_id)
                 pd.cancel_sent = time.monotonic()
                 self.journal(f"{pd.kind}_timeout_cancel_requested", contract=pd.contract.label(), limit=pd.limit)

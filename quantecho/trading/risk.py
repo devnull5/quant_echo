@@ -20,7 +20,8 @@ class RiskLimits:
     daily_loss_limit: float = 300.0           # realized + open P&L; hitting it halts new entries for the day
     max_entries_per_day: int = 6
     max_spread_pct: float = 0.10              # skip contracts whose bid/ask spread is > 10% of mid
-    entry_start: str = "09:30"                # ET; market open
+    entry_start: str = "07:30"                # ET; first new entry AND first order of any kind (pre-market
+                                              # option trading). Exits before it wait for this time.
     entry_end: str = "15:30"                  # ET; no new entries late in the day
     trading_days_only: bool = True
 
@@ -54,10 +55,10 @@ def size_position(limits: RiskLimits, price: float) -> int:
     return max(0, min(n, limits.max_contracts_per_trade))
 
 
-def market_open(now: datetime) -> bool:
-    """Regular options session, Mon-Fri 09:30-16:00 ET (exchange holidays aren't modeled; the broker rejects)."""
+def market_open(now: datetime, start: str = "09:30") -> bool:
+    """Options trading session, Mon-Fri `start`-16:00 ET (exchange holidays aren't modeled; the broker rejects)."""
     now = now.astimezone(NY)
-    return now.weekday() < 5 and dtime(9, 30) <= now.time() < dtime(16, 0)
+    return now.weekday() < 5 and _hm(start) <= now.time() < dtime(16, 0)
 
 
 def in_entry_window(limits: RiskLimits, now: datetime) -> bool:

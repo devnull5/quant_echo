@@ -54,6 +54,7 @@ class TradingPanel(tk.Toplevel):
             "max_open": tk.StringVar(value=str(t.get("max_open", L.max_open_positions))),
             "daily_loss": tk.StringVar(value=str(t.get("daily_loss", L.daily_loss_limit))),
             "max_entries": tk.StringVar(value=str(t.get("max_entries", L.max_entries_per_day))),
+            "entry_start": tk.StringVar(value=str(t.get("entry_start", L.entry_start))),
             "target_dte": tk.StringVar(value=str(t.get("target_dte", P.target_dte))),
             "min_dte": tk.StringVar(value=str(t.get("min_dte", P.min_dte))),
             "max_dte": tk.StringVar(value=str(t.get("max_dte", P.max_dte))),
@@ -128,6 +129,7 @@ class TradingPanel(tk.Toplevel):
         self._row(r2, "Max open", self.v["max_open"], 4)
         self._row(r2, "Daily loss $", self.v["daily_loss"], 7)
         self._row(r2, "Entries/day", self.v["max_entries"], 4)
+        self._row(r2, "Trade from (ET)", self.v["entry_start"], 6)
         ttk.Checkbutton(r2, text="Confirm every order", variable=self.v["confirm_each"]).pack(side="left", padx=10)
 
         strat = ttk.LabelFrame(cfg, text="Strategy (trend B → call, S → put)", padding=6)
@@ -184,6 +186,18 @@ class TradingPanel(tk.Toplevel):
             raise ValueError(f"'{key}' must be between {lo} and {hi}")
         return x
 
+    def _hhmm(self, key: str, lo: str, hi: str) -> str:
+        raw = str(self.v[key].get()).strip()
+        try:
+            h, m = (int(x) for x in raw.split(":"))
+            val = f"{h:02d}:{m:02d}"
+            ok = 0 <= h < 24 and 0 <= m < 60 and lo <= val <= hi
+        except ValueError:
+            ok = False
+        if not ok:
+            raise ValueError(f"'{key}' must be a time HH:MM between {lo} and {hi} ET")
+        return val
+
     def limits_and_params(self):
         syms = [s.upper() for s in str(self.v["symbols"].get()).replace(",", " ").split() if s.strip()]
         if not syms:
@@ -192,7 +206,8 @@ class TradingPanel(tk.Toplevel):
                        max_contracts_per_trade=self._num("max_contracts", int, 1, 100),
                        max_open_positions=self._num("max_open", int, 1, 20),
                        daily_loss_limit=self._num("daily_loss", float, 1, 1e6),
-                       max_entries_per_day=self._num("max_entries", int, 1, 100))
+                       max_entries_per_day=self._num("max_entries", int, 1, 100),
+                       entry_start=self._hhmm("entry_start", "04:00", "15:30"))
         P = StrategyParams(target_dte=self._num("target_dte", int, 0, 60), min_dte=self._num("min_dte", int, 0, 60),
                            max_dte=self._num("max_dte", int, 0, 90), strikes_otm=self._num("strikes_otm", int, 0, 10),
                            stop_loss_pct=self._num("sl", float, 0.5, 100) / 100,

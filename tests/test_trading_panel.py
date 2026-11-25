@@ -179,6 +179,16 @@ class TestTradingPanel(unittest.TestCase):
         self.assertEqual(cfg._keyring.d[("quantecho", "tasty_sandbox_secret")], "SANDBOX-SECRET")
         self.assertNotIn("SANDBOX-SECRET", str(self.app.settings.trading))
 
+    def test_trade_from_time(self):
+        p = self.open()
+        self.assertEqual(p.v["entry_start"].get(), "07:30")
+        p.v["entry_start"].set("8:05")
+        self.assertEqual(p.limits_and_params()[0].entry_start, "08:05")
+        for bad in ("25:00", "7.30", "16:00", "03:00"):
+            p.v["entry_start"].set(bad)
+            with self.assertRaises(ValueError):
+                p.limits_and_params()
+
     def test_saved_trading_settings_survive_main_save(self):
         p = self.open()
         p.v["max_premium"].set("5000")

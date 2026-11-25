@@ -179,10 +179,14 @@ class TestPricingRiskStrategy(unittest.TestCase):
         L, st = RiskLimits(), DayState()
         wed11 = datetime(2026, 11, 11, 11, 0, tzinfo=NY)
         self.assertEqual(check_entry(L, st, "SPY", [], 1.0, 0.02, 0, wed11), (True, []))
-        ok, why = check_entry(L, st, "TSLA", [], 1.0, 0.02, 0, datetime(2026, 11, 11, 9, 29, tzinfo=NY))
+        ok, why = check_entry(L, st, "TSLA", [], 1.0, 0.02, 0, datetime(2026, 11, 11, 7, 29, tzinfo=NY))
         self.assertFalse(ok)
         self.assertTrue(any("allowlist" in w for w in why) and any("entry window" in w for w in why))
-        self.assertTrue(check_entry(L, st, "SPY", [], 1.0, 0.02, 0, datetime(2026, 11, 11, 9, 30, tzinfo=NY))[0])  # open
+        self.assertTrue(check_entry(L, st, "SPY", [], 1.0, 0.02, 0, datetime(2026, 11, 11, 7, 30, tzinfo=NY))[0])  # 07:30
+        from quantecho.trading.risk import market_open
+        self.assertFalse(market_open(datetime(2026, 11, 11, 7, 29, tzinfo=NY), L.entry_start))
+        self.assertTrue(market_open(datetime(2026, 11, 11, 7, 30, tzinfo=NY), L.entry_start))
+        self.assertFalse(market_open(datetime(2026, 11, 11, 16, 0, tzinfo=NY), L.entry_start))
         self.assertFalse(check_entry(L, st, "SPY", ["SPY"], 1.0, 0.02, 0, wed11)[0])           # already holding
         self.assertFalse(check_entry(L, st, "SPY", [], 5.0, 0.02, 0, wed11)[0])                # $500 > $300
         self.assertFalse(check_entry(L, st, "SPY", [], 1.0, 0.20, 0, wed11)[0])                # wide spread
@@ -350,7 +354,7 @@ class TestJoinTrendOnStart(unittest.TestCase):
 
     def test_waits_for_entry_window(self):
         bot = self.make(bars=self.late)
-        self.now = datetime(2026, 11, 11, 9, 0, tzinfo=NY)
+        self.now = datetime(2026, 11, 11, 7, 0, tzinfo=NY)
         bot.step()
         self.assertFalse(bot.pending)                # pre-market: not used up
         self.now = datetime(2026, 11, 11, 11, 0, tzinfo=NY)

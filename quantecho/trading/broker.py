@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..logsetup import log
@@ -25,6 +25,10 @@ class OrderResult:
 
 class Broker:
     name = "broker"
+    clock: Optional[Callable[[], datetime]] = None   # the bot's clock (modeled prices/chains); None = wall clock
+
+    def _now(self) -> Optional[datetime]:
+        return self.clock() if self.clock else None
     real_money = False
 
     def tick_rules(self, root: str) -> TickRules:
@@ -62,14 +66,15 @@ class SimBroker(Broker):
         self._lock = threading.Lock()
 
     def chain(self, root: str, spot: float) -> Chain:
-        return synthetic_chain(root, spot)
+        now = self._now()
+        return synthetic_chain(root, spot, now.date() if now else None)
 
     def quote(self, c: OptionContract, spot: float) -> OptionQuote:
         if self.quote_client is not None:
             q = _real_quote(self.quote_client, c)
             if q:
                 return q
-        return model_quote(c, spot, self.iv.get(c.root))
+        return model_quote(c, spot, self.iv.get(c.root), now=self._now())
 
     def _try_fill(self, o: Dict[str, Any], q: OptionQuote) -> Optional[float]:
         if o.get("market"):
@@ -165,7 +170,7 @@ class TastyBroker(Broker):
             q = _real_quote(self.quote_client, c)
             if q:
                 return q
-        return model_quote(c, spot, self.iv.get(c.root))  # sandbox has no market data
+        return model_quote(c, spot, self.iv.get(c.root), now=self._now())  # sandbox has no market data
 
     def submit(self, c, action, qty, limit, ext_id, market=False) -> OrderResult:
         order = build_option_order(c.symbol, action, qty, limit, ext_id, market=market)
