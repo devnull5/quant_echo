@@ -24,6 +24,8 @@ class RiskLimits:
                                               # option trading). Exits before it wait for this time.
     entry_end: str = "15:30"                  # ET; no new entries late in the day
     trading_days_only: bool = True
+    max_bar_age_s: float = 300.0              # no new entries while the newest minute bar is older than this
+                                              # (2026-11-27: the feed sat on the prior day's close; 0 = off)
 
     def to_dict(self) -> Dict:
         return asdict(self)

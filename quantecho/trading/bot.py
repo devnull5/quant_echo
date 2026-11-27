@@ -118,6 +118,7 @@ class TradingBot:
         self._seen_signal_t: Dict[str, int] = {}
         self._joined: set = set()             # symbols already checked for 'join the trend at start'
         self._closed_note = None              # date we last journaled 'market closed'
+        self._stale: set = set()              # symbols whose bars are currently too old to trade on
         self._last_sig: Dict[str, Optional[Signal]] = {}
         self._reenter: Dict[str, tuple] = {}  # scalp: sym -> (side, bar t at the target exit) to re-enter from
         self.rule = ConfluenceRule()
@@ -255,6 +256,22 @@ class TradingBot:
                                             f"EMA20, price {'above' if up else 'below'} VWAP)")
         return None
 
+    def _data_stale(self, sym: str, bars: List[Dict[str, Any]], now: datetime) -> bool:
+        """Newest bar too old to trade on (feed lagging or still on the previous session). Journaled once."""
+        lim = self.limits.max_bar_age_s
+        age = now.timestamp() - bars[-1]["t"] / 1000
+        if not lim or age <= lim or not in_entry_window(self.limits, now):
+            if sym in self._stale:
+                self._stale.discard(sym)
+                self.journal("data_ok", symbol=sym, note="fresh bars again; signals resume")
+            return False
+        if sym not in self._stale:
+            self._stale.add(sym)
+            last = datetime.fromtimestamp(bars[-1]["t"] / 1000, NY)
+            self.journal("stale_data", symbol=sym, last_bar=f"{last:%Y-%m-%d %H:%M} ET", age_min=round(age / 60),
+                         note="no new entries until the data source catches up")
+        return True
+
     def _new_confluence_signal(self) -> Optional[Signal]:
         """Confluence signal on the minute that JUST closed (all legs aligned), reported once."""
         series = {}
@@ -293,6 +310,9 @@ class TradingBot:
                 if not bars:
                     continue
                 spot = bars[-1]["close"]
+                if self._data_stale(sym, bars, now):
+                    self._manage_position(sym, spot, now, None)   # exits/EOD/kill still run; no new signals
+                    continue
                 if confl:
                     sig = confl_sig if sym == self.rule.target else None   # only the target trades
                 else:

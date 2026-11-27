@@ -246,7 +246,7 @@ class TestBotEndToEnd(unittest.TestCase):
     def make(self, params=None, bars=None, **kw):
         from quantecho.trading.bot import TradingBot
         self.data = FakeData(bars if bars is not None else self.bars)
-        limits = RiskLimits(max_premium_per_trade=1200)   # a 7-DTE ATM SPY call models at ~$5 (~$500/contract)
+        limits = RiskLimits(max_premium_per_trade=1200, max_bar_age_s=0)   # fixed clock; a 7-DTE ATM SPY call models at ~$5 (~$500/contract)
         return TradingBot(SimBroker(), self.data, limits, params or StrategyParams(), queue.Queue(),
                           journal_dir=Path(self.tmp.name), clock=lambda: self.now, bars_every_s=0, **kw)
 
@@ -310,12 +310,26 @@ class TestBotEndToEnd(unittest.TestCase):
 
     def test_default_budget_blocks_expensive_contract(self):
         from quantecho.trading.bot import TradingBot
-        bot = TradingBot(SimBroker(), FakeData(self.bars), RiskLimits(), StrategyParams(), queue.Queue(),
+        bot = TradingBot(SimBroker(), FakeData(self.bars), RiskLimits(max_bar_age_s=0), StrategyParams(), queue.Queue(),
                          journal_dir=Path(self.tmp.name), clock=lambda: self.now, bars_every_s=0)
         bot.step()
         self.assertEqual((len(bot.pending), len(bot.positions)), (0, 0))
         log = (Path(self.tmp.name) / "2026-11-11.jsonl").read_text()
         self.assertIn("exceeds max premium", log)
+
+    def test_stale_bars_block_entries(self):
+        from quantecho.trading.bot import TradingBot
+        last = datetime.fromtimestamp(self.bars[-1]["t"] / 1000, NY)
+        self.now = last.replace(day=13)                        # bars are from two days ago (pre-market feed gap)
+        bot = TradingBot(SimBroker(), FakeData(self.bars), RiskLimits(max_premium_per_trade=1200), StrategyParams(),
+                         queue.Queue(), journal_dir=Path(self.tmp.name), clock=lambda: self.now, bars_every_s=0)
+        bot.step(); bot.step()
+        self.assertEqual((len(bot.pending), len(bot.positions)), (0, 0))
+        log = (Path(self.tmp.name) / "2026-11-13.jsonl").read_text(encoding="utf-8")
+        self.assertEqual(log.count('"stale_data"'), 1)          # journaled once, not every step
+        self.now = last + __import__("datetime").timedelta(seconds=30)    # fresh again -> trades
+        bot.step()
+        self.assertEqual(len(bot.pending), 1)
 
     def test_outside_window_blocked(self):
         self.now = datetime(2026, 11, 11, 15, 50, tzinfo=NY)
@@ -741,7 +755,8 @@ class TestBotConfluence(unittest.TestCase):
         data.bars = {sym: [b for b in bars if b["t"] <= cut] for sym, bars in full.items()}
         tmp = tempfile.TemporaryDirectory()
         try:
-            bot = TradingBot(SimBroker(), data, RiskLimits(allowed_symbols=["SPY", "NVDA"], max_premium_per_trade=1500),
+            bot = TradingBot(SimBroker(), data, RiskLimits(allowed_symbols=["SPY", "NVDA"], max_premium_per_trade=1500,
+                                                                max_bar_age_s=0),
                              StrategyParams(signal_source="confluence"), queue.Queue(), journal_dir=Path(tmp.name),
                              clock=lambda: datetime(2026, 11, 11, 11, 0, tzinfo=NY), bars_every_s=0)
             bot.step()

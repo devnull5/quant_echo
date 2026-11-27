@@ -7,6 +7,7 @@ Quotes use the batch `spark` endpoint (max 20 symbols per call) so a 21-symbol w
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
@@ -146,8 +147,13 @@ class YahooProvider:
         return out
 
     def get_session_minute_bars(self, symbol: str) -> List[Dict[str, Any]]:
+        # An explicit window, NOT range=5d: Yahoo's range queries leave out today's pre-market bars until the
+        # regular session opens, so the chart (and the bot) sat on the previous day's after-hours close while
+        # the watchlist already showed the pre-market price (2026-11-27: 720 vs 729).
+        now = int(time.time())
         return parse_bars(self.http.get(f"chart/{to_yahoo(symbol)}",
-                                        {"interval": "1m", "range": "5d", "includePrePost": "true"}))
+                                        {"interval": "1m", "period1": now - 5 * 86400, "period2": now + 60,
+                                         "includePrePost": "true"}))
 
 
 SPEC = ProviderSpec(
