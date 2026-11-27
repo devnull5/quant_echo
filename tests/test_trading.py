@@ -427,6 +427,130 @@ class TestDynamicExit(unittest.TestCase):
             t.tearDown()
 
 
+class TestScalpMode(unittest.TestCase):
+    """Scalp mode: quick target, hold dips until the trend breaks (close across EMA20), re-enter while it holds."""
+    make, tearDown = TestBotEndToEnd.make, TestBotEndToEnd.tearDown
+
+    def setUp(self):
+        TestBotEndToEnd.setUp(self)
+
+    def test_exit_rules(self):
+        from quantecho.trading.strategy import trend_break_reason
+        sp = StrategyParams(scalp=True)                          # +12% target, -35% disaster, no hard -15% stop
+        c0 = OptionContract("SPY", date(2026, 11, 18), "C", 600)
+        t0, t1 = datetime(2026, 11, 11, 10, tzinfo=NY), datetime(2026, 11, 11, 11, tzinfo=NY)
+        self.assertIn("scalp target", exit_reason(1.0, 1.12, c0, t0, t1, None, sp))
+        self.assertIsNone(exit_reason(1.0, 1.11, c0, t0, t1, None, sp))
+        self.assertIsNone(exit_reason(1.0, 0.70, c0, t0, t1, None, sp))     # -30%: held (the trend decides)
+        self.assertTrue(exit_reason(1.0, 0.65, c0, t0, t1, None, sp).startswith("stop loss: disaster"))
+        self.assertIn("flatten", exit_reason(1.0, 1.0, c0, t0, datetime(2026, 11, 11, 15, 50, tzinfo=NY), None, sp))
+        put = OptionContract("SPY", date(2026, 11, 18), "P", 600)
+        self.assertIn("trend broke", trend_break_reason(c0, 599.0, 600.0))
+        self.assertIsNone(trend_break_reason(c0, 601.0, 600.0))
+        self.assertIn("trend broke", trend_break_reason(put, 601.0, 600.0))
+        self.assertIsNone(trend_break_reason(put, 599.0, None))
+
+    def _enter(self, **kw):
+        bot = self.make(params=StrategyParams(scalp=True, **kw))
+        bot.step(); bot.step()                                   # crossover -> entry -> fill
+        self.assertIn("SPY", bot.positions)
+        return bot
+
+    def test_target_then_reentry_while_trend_holds(self):
+        from types import SimpleNamespace
+        bot = self._enter()
+        pos = bot.positions["SPY"]
+        real_quote = bot.broker.quote
+        bot.broker.quote = lambda c, spot: SimpleNamespace(bid=pos.ref * 1.15 - 0.01, ask=pos.ref * 1.15 + 0.01,
+                                                           modeled=True)
+        bot.step()                                               # +15% >= +12% target -> sell
+        self.assertTrue(pos.closing)
+        bot.broker.quote = real_quote
+        if "SPY" in bot.positions:                               # exit order still working in SIM: fill it
+            bot.pending.clear()
+            bot._closed(pos, round(pos.ref * 1.15, 2), "scalp target (+15%)")
+        self.assertIn("SPY", bot._reenter)
+        bot.step()
+        self.assertFalse(bot.pending)                            # same closed bar as the exit: no re-buy yet
+        bars = self.data.bars["SPY"]
+        for _ in range(2):                                       # the rally continues on new bars
+            last = bars[-1]
+            bars.append({**last, "t": last["t"] + 60_000, "open": last["close"], "close": last["close"] + 0.3,
+                         "high": last["close"] + 0.35, "low": last["close"] - 0.05})
+        bot.step()
+        self.assertEqual(len(bot.pending), 1)
+        self.assertIn("scalp re-entry", bot._last_sig["SPY"].reason)
+        self.assertNotIn("SPY", bot._reenter)                    # one re-entry per target hit
+
+    def test_no_reentry_after_trend_break_or_when_off(self):
+        bot = self._enter()
+        pos = bot.positions["SPY"]
+        bot._closed(pos, pos.entry_price * 0.9, "trend broke (close 1 < EMA20 2)")
+        self.assertNotIn("SPY", bot._reenter)
+        bot2 = self._enter(scalp_reentry=False)
+        p2 = bot2.positions["SPY"]
+        bot2._closed(p2, p2.entry_price * 1.2, "scalp target (+20%)")
+        self.assertNotIn("SPY", bot2._reenter)
+
+    def test_dip_held_until_close_below_ema20(self):
+        bot = self._enter()
+        pos = bot.positions["SPY"]
+        bars = self.data.bars["SPY"]
+        last = bars[-1]
+        dip = round(compute_series(bars).ema20[-1] + 0.05, 2)   # pulls back but closes ABOVE EMA20: hold
+        bars[-1] = {**last, "close": dip, "low": dip - 0.05}
+        bars.append({**bars[-1], "t": last["t"] + 60_000, "open": dip})
+        bot.step()
+        self.assertFalse(pos.closing)
+        brk = round(compute_series(bars).ema20[-2] - 0.4, 2)     # next bar closes BELOW EMA20: sell
+        bars[-1] = {**bars[-1], "close": brk, "low": brk - 0.05}
+        bars.append({**bars[-1], "t": bars[-1]["t"] + 60_000, "open": brk})
+        bot.step()
+        self.assertTrue(pos.closing)
+        ex = [json.loads(x) for x in (Path(self.tmp.name) / "2026-11-11.jsonl").read_text().splitlines()
+              if '"exit_order"' in x]
+        self.assertRegex(ex[-1]["reason"], "trend broke|opposite signal")
+
+
+class TestManualTrades(unittest.TestCase):
+    PASTE = "\n".join([
+        "Sell SPY $717 Call 11/25", "Individual · 24h", "$950.00", "10 contracts at $0.95", "",
+        "Buy SPY $717 Call 11/25", "Individual · 24h", "$870.00", "10 contracts at $0.87", "",
+        "Sell SPY $715 Call 11/25", "Individual · Nov 25", "$240.00", "1 contract at $2.40", "",
+        "Sell SPY $715 Call 11/25", "Individual · Nov 25", "Canceled", "",
+        "Sell SPY $715 Call 11/25", "Individual · Nov 25", "$220.00", "1 contract at $2.20", "",
+        "Buy SPY $715 Call 11/25", "Individual · Nov 25", "$388.00", "2 contracts at $1.94", "",
+        "Buy NVDA $141 Put 11/25", "Individual · Nov 25", "$195.00", "1 contract at $1.95", ""])
+
+    def test_parse_match_record_dedupe(self):
+        import csv
+
+        from quantecho.trading.bot import TradingBot
+        from quantecho.trading.manual import import_text, parse_fills, round_trips
+        fills = parse_fills(self.PASTE, 2026)
+        self.assertEqual([(f.side, f.qty) for f in fills], [("buy", 1), ("buy", 2), ("sell", 1), ("sell", 1),
+                                                             ("buy", 10), ("sell", 10)])   # oldest first, no cancel
+        self.assertEqual(fills[0].contract, OptionContract("NVDA", date(2026, 11, 25), "P", 141))
+        trips, still = round_trips(fills)
+        self.assertEqual([(t.qty, t.entry, t.exit, t.pnl) for t in trips],
+                         [(1, 1.94, 2.20, 26.0), (1, 1.94, 2.40, 46.0), (10, 0.87, 0.95, 80.0)])
+        self.assertEqual(still, {"NVDA Nov 25 141P": 1})
+        with tempfile.TemporaryDirectory() as d:
+            ledger = Path(d) / "pnl_ledger.csv"
+            out, added = import_text(self.PASTE, ledger=ledger)
+            self.assertEqual(added, 3)
+            self.assertIn("$+152.00", out)
+            self.assertEqual(import_text(self.PASTE, ledger=ledger)[1], 0)     # same paste twice: nothing new
+            self.assertEqual(import_text(self.PASTE, ledger=ledger, dry_run=True)[1], 0)
+            with ledger.open(encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(({r["mode"] for r in rows}, len(rows)), ({"manual"}, 3))
+            self.assertTrue(rows[0]["closed_at"].startswith("2026-11-25"))
+            bot = TradingBot(SimBroker(), FakeData([]), RiskLimits(), StrategyParams(), queue.Queue(),
+                             journal_dir=Path(d), clock=lambda: datetime(2026, 11, 25, 12, tzinfo=NY))
+            self.assertEqual((bot.lifetime_pnl, bot.state.realized_pnl), (0.0, 0.0))   # bot P&L ignores manual
+
+
 class TestExitSafety(unittest.TestCase):
     """Regressions from the 2026-11-12 sandbox run: an unfilled exit was cancelled and re-sent every ~27 s
     for hours (incl. after the close), each new order rejected because the old cancel hadn't landed."""

@@ -70,6 +70,10 @@ class TradingPanel(tk.Toplevel):
             "fade_exit": tk.BooleanVar(value=bool(t.get("fade_exit", P.fade_exit))),
             "close_eod": tk.BooleanVar(value=bool(t.get("close_eod", P.close_all_eod))),
             "signal_source": tk.StringVar(value=t.get("signal_source", "Trend (per symbol)")),
+            "scalp": tk.BooleanVar(value=bool(t.get("scalp", P.scalp))),
+            "scalp_target": tk.StringVar(value=str(t.get("scalp_target", round(P.scalp_target_pct * 100)))),
+            "scalp_disaster": tk.StringVar(value=str(t.get("scalp_disaster", round(P.scalp_disaster_pct * 100)))),
+            "scalp_reentry": tk.BooleanVar(value=bool(t.get("scalp_reentry", P.scalp_reentry))),
         }
         self.v_secret = {k: tk.StringVar(value=secret_get(k) or "") for pair in SECRETS.values() for k in pair}
         self.v_status = tk.StringVar(value="Bot stopped")
@@ -152,6 +156,15 @@ class TradingPanel(tk.Toplevel):
         self._row(s_tr, "or % of gain", self.v["trail_frac"], 3)
         ttk.Checkbutton(s_tr, text="Sell when momentum fades", variable=self.v["fade_exit"]).pack(side="left", padx=6)
         ttk.Checkbutton(s_tr, text="Close all by 15:45", variable=self.v["close_eod"]).pack(side="left")
+        s_sc = ttk.Frame(strat)
+        s_sc.pack(fill="x", pady=(0, 4))
+        ttk.Checkbutton(s_sc, text="Scalp mode:", variable=self.v["scalp"]).pack(side="left", padx=(8, 0))
+        self._row(s_sc, "take profit +%", self.v["scalp_target"], 4)
+        self._row(s_sc, "disaster stop -%", self.v["scalp_disaster"], 4)
+        ttk.Checkbutton(s_sc, text="Re-enter while trend holds", variable=self.v["scalp_reentry"]).pack(side="left", padx=6)
+        ttk.Label(strat, text="Scalp: sells at the target; holds dips and sells only if price closes back across "
+                              "EMA20 (or the disaster stop). Replaces the hard stop, trailing stop and fade exit.",
+                  style="Muted.TLabel", wraplength=480).pack(fill="x", padx=8, pady=(0, 4))
         s3 = ttk.Frame(strat)
         s3.pack(fill="x")
         ttk.Label(s3, text="Signal source", style="Muted.TLabel").pack(side="left", padx=(8, 3))
@@ -162,6 +175,7 @@ class TradingPanel(tk.Toplevel):
         st = ttk.Frame(self, padding=(8, 6))
         st.pack(fill="x")
         ttk.Label(st, textvariable=self.v_status, style="H.TLabel").pack(side="left")
+        ttk.Button(st, text="Log my trades…", command=self.on_log_trades).pack(side="right")
 
         cols = ("qty", "entry", "mark", "pnl", "priced")
         self.pos = ttk.Treeview(self, columns=cols, show="tree headings", height=4)
@@ -221,7 +235,11 @@ class TradingPanel(tk.Toplevel):
                            trail_giveback_pct=self._num("trail_give", float, 0, 100) / 100,
                            trail_giveback_frac=self._num("trail_frac", float, 0, 100) / 100,
                            fade_exit=bool(self.v["fade_exit"].get()),
-                           close_all_eod=bool(self.v["close_eod"].get()))
+                           close_all_eod=bool(self.v["close_eod"].get()),
+                           scalp=bool(self.v["scalp"].get()),
+                           scalp_target_pct=self._num("scalp_target", float, 1, 500) / 100,
+                           scalp_disaster_pct=self._num("scalp_disaster", float, 1, 100) / 100,
+                           scalp_reentry=bool(self.v["scalp_reentry"].get()))
         if not P.min_dte <= P.target_dte <= P.max_dte:
             raise ValueError("DTE must satisfy Min <= Target <= Max")
         if P.signal_source == "confluence" and "NVDA" not in L.allowed_symbols:
@@ -331,7 +349,44 @@ class TradingPanel(tk.Toplevel):
             messagebox.showerror("Can't start bot", str(e), parent=self)
             return
         self.bot.start()
-        self.log(f"▶ Bot started: {broker.name}, data from {data_label}, symbols {L.allowed_symbols}")
+        self.log(f"▶ Bot started: {broker.name}, data from {data_label}, symbols {L.allowed_symbols}"
+                 + (" · SCALP MODE" if P.scalp else ""))
+        if P.scalp and L.max_entries_per_day < 15:
+            self.log(f"   ↳ note: scalp mode re-enters often; Entries/day is {L.max_entries_per_day}, so it will stop "
+                     "for the day early (about 20 fits a normal session).")
+
+    def on_log_trades(self) -> None:
+        """Paste your own fills (broker order history) -> P&L ledger as 'manual' trades."""
+        from datetime import date
+        from .manual import import_text
+        w = tk.Toplevel(self)
+        w.title("Log my trades")
+        w.configure(bg=C["panel"])
+        w.geometry("640x520")
+        ttk.Label(w, style="Muted.TLabel", wraplength=600, padding=8,
+                  text="Paste your filled orders (e.g. 'Buy SPY $717 Call 11/25 … 10 contracts at $0.87'), newest "
+                       "first as your broker lists them. Buys and sells are matched into round trips and saved to "
+                       "the P&L ledger as 'manual', separate from the bot. Pasting the same trades twice adds nothing.").pack(fill="x")
+        box = tk.Text(w, height=16, bg=C["sunken"], fg=C["text"], insertbackground=C["text"], relief="flat",
+                      font=("Consolas", 9))
+        box.pack(fill="both", expand=True, padx=8)
+        bar = ttk.Frame(w, padding=8)
+        bar.pack(fill="x")
+        v_date = tk.StringVar(value="")
+        self._row(bar, "Trade date (YYYY-MM-DD, blank = expiry)", v_date, 12)
+
+        def run(dry: bool) -> None:
+            try:
+                d = str(v_date.get()).strip()
+                out, _ = import_text(box.get("1.0", "end"), date.fromisoformat(d) if d else None, dry_run=dry)
+            except Exception as e:
+                messagebox.showerror("Log my trades", f"{type(e).__name__}: {e}", parent=w)
+                return
+            self.log(out)
+            if not dry:
+                w.destroy()
+        ttk.Button(bar, text="Save", command=lambda: run(False)).pack(side="right")
+        ttk.Button(bar, text="Preview", command=lambda: run(True)).pack(side="right", padx=6)
 
     def on_stop(self) -> None:
         if self.bot:

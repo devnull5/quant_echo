@@ -191,6 +191,18 @@ class TestTradingPanel(unittest.TestCase):
             with self.assertRaises(ValueError):
                 p.limits_and_params()
 
+    def test_scalp_mode_fields(self):
+        p = self.open()
+        self.assertFalse(p.limits_and_params()[1].scalp)
+        p.v["scalp"].set(True)
+        p.v["scalp_target"].set("10")
+        p.v["scalp_disaster"].set("40")
+        P = p.limits_and_params()[1]
+        self.assertEqual((P.scalp, P.scalp_target_pct, P.scalp_disaster_pct, P.scalp_reentry), (True, 0.10, 0.40, True))
+        p.v["scalp_disaster"].set("0")
+        with self.assertRaises(ValueError):
+            p.limits_and_params()
+
     def test_saved_trading_settings_survive_main_save(self):
         p = self.open()
         p.v["max_premium"].set("5000")

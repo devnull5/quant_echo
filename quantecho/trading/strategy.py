@@ -5,6 +5,8 @@ Entry: trend BUY (EMA9 crosses above EMA20, price above VWAP) -> buy a call;
 Contract: expiration nearest to target_dte within [min_dte, max_dte]; strike nearest ATM (or N strikes OTM).
 Exits (first that fires): take-profit, stop-loss, opposite trend signal, time exit before expiry,
 end-of-day flatten for options expiring today/tomorrow.
+Scalp mode: +target take-profit, exit when the underlying closes back across EMA20 (trend broke), a wide
+disaster stop, and re-entry on a later bar while the trend still holds.
 
 These rules are mechanical and have no proven edge. Test in sim/sandbox before risking money.
 """
@@ -42,6 +44,13 @@ class StrategyParams:
     flatten_at: str = "15:45"            # ET: from here on, close positions (all of them if close_all_eod)
     close_all_eod: bool = True           # day-trade: flat every night. Off = only options expiring today/tomorrow
     max_hold_days: int = 5
+    # SCALP MODE (built from the user's 2026-11-25 manual trades: 11 round trips, all winners, +5% to +57%,
+    # median ~+12%, holding through dips while the trend stayed intact). When on, it REPLACES the hard stop,
+    # trailing stop and momentum-fade exits with:
+    scalp: bool = False
+    scalp_target_pct: float = 0.12       # take the quick profit at +12% on the premium
+    scalp_disaster_pct: float = 0.35     # wide premium stop for crashes only; the trend break is the real stop
+    scalp_reentry: bool = True           # after a target hit, re-enter on a later bar if the trend still holds
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -84,7 +93,13 @@ def exit_reason(entry_price: float, mark: float, contract: OptionContract, opene
                 last_signal: Optional[Signal], p: StrategyParams) -> Optional[str]:
     """Why to close now (None = hold)."""
     now = now.astimezone(NY)
-    if entry_price > 0:
+    if entry_price > 0 and p.scalp:
+        chg = (mark - entry_price) / entry_price
+        if chg >= p.scalp_target_pct - 1e-9:
+            return f"scalp target ({chg:+.0%})"
+        if chg <= -p.scalp_disaster_pct:
+            return f"stop loss: disaster ({chg:+.0%})"
+    elif entry_price > 0:
         chg = (mark - entry_price) / entry_price
         if p.take_profit_pct and chg >= p.take_profit_pct:
             return f"take profit ({chg:+.0%})"
@@ -135,6 +150,18 @@ def fade_reason(contract: OptionContract, close: float, ema9: Optional[float]) -
         return f"momentum faded (close {close:.2f} < EMA9 {ema9:.2f})"
     if not contract.is_call and close > ema9:
         return f"momentum faded (close {close:.2f} > EMA9 {ema9:.2f})"
+    return None
+
+
+def trend_break_reason(contract: OptionContract, close: float, ema20: Optional[float]) -> Optional[str]:
+    """Scalp mode's real stop: the underlying's last closed bar is back across EMA20, i.e. the trend that
+    justified the trade is gone. Dips that hold EMA20 are ridden out (the bot would only re-buy them)."""
+    if ema20 is None:
+        return None
+    if contract.is_call and close < ema20:
+        return f"trend broke (close {close:.2f} < EMA20 {ema20:.2f})"
+    if not contract.is_call and close > ema20:
+        return f"trend broke (close {close:.2f} > EMA20 {ema20:.2f})"
     return None
 
 

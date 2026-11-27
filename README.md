@@ -148,6 +148,13 @@ With modeled quotes, % rules are measured from the modeled price at entry, not t
 On start the bot adopts option positions already held at the broker.
 **Join trend at start** (on by default): if no crossover has fired yet when the bot starts (or the entry
 window opens), it enters once per symbol when EMA9/EMA20 and VWAP already agree on a direction.
+**Scalp mode** (checkbox, off by default; built from a day of manual 0-DTE trades: 12 round trips, all winners,
++5% to +57%, median +13%, holding through dips while the trend held): sells at **+12%**, holds dips and sells
+only when the underlying **closes back across EMA20** (the trend broke) or the premium hits a wide **-35% disaster
+stop**. It replaces the hard stop, trailing stop and fade exit. After a target hit it **re-enters** on a later bar if
+EMA9/EMA20 and VWAP still agree and that bar closed back beyond EMA9. It trades often, so raise Entries/day
+(~20). In a replay of 19 sessions (Oct 30-Nov 25, SPY+NVDA, 0 DTE, modeled prices, 20 entries/day) it made
++$1.3k on 11 up days vs -$0.15k for the default exits; without re-entry, +$0.5k. Modeled prices, no proven edge.
 **Hard limits** (`risk.py`, not overridable by the strategy): $300 max premium per trade, 2 contracts, 2 open
 positions, one per symbol, $300 daily loss limit (halts entries), 6 entries/day, max 10% bid/ask spread,
 entries only 07:30-15:30 ET on weekdays (pre-market option trading; set "Trade from" to change). **Kill switch** cancels working orders, sells everything at the bid
@@ -157,6 +164,9 @@ a unique `external-identifier` per order, and a timed-out submit is looked up, *
 Every decision is journaled to `~/.quanteco_gpt/trades/YYYY-MM-DD.jsonl`.
 Every closed trade is also appended to `~/.quanteco_gpt/trades/pnl_ledger.csv`; the panel shows today's P&L
 (realized + open) and lifetime realized P&L per mode, and a restart reloads today's P&L so the daily loss limit holds.
+**Your own trades:** **Log my trades…** (or `python -m quantecho.trading.manual trades.txt`) takes your broker's
+order history pasted as text ("Buy SPY $717 Call 11/25 … 10 contracts at $0.87"), matches buys to sells FIFO and
+adds the round trips to the ledger as mode `manual`, apart from the bot's P&L. Re-importing the same text adds nothing.
 
 **Using it:** click **📈 Trading** in the toolbar (source checkouts only). Pick a mode, enter credentials
 (stored in Windows Credential Manager), use **Test** to verify the connection, set limits/strategy, then

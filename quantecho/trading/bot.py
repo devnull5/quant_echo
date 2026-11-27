@@ -24,7 +24,7 @@ from .broker import Broker
 from .occ import OptionContract
 from .risk import DayState, RiskLimits, check_entry, in_entry_window, market_open, size_position
 from .strategy import (StrategyParams, entry_limit, entry_side, exit_limit, exit_reason, fade_reason, pick_contract,
-                       trail_armed, trail_reason)
+                       trail_armed, trail_reason, trend_break_reason)
 from .tasty import new_external_id
 
 NY = ZoneInfo("America/New_York")
@@ -119,6 +119,7 @@ class TradingBot:
         self._joined: set = set()             # symbols already checked for 'join the trend at start'
         self._closed_note = None              # date we last journaled 'market closed'
         self._last_sig: Dict[str, Optional[Signal]] = {}
+        self._reenter: Dict[str, tuple] = {}  # scalp: sym -> (side, bar t at the target exit) to re-enter from
         self.rule = ConfluenceRule()
         self._confl_seen_t: Optional[int] = None
         self._stop = threading.Event()
@@ -230,6 +231,30 @@ class TradingBot:
             return Signal(i, "sell", "trend", "already in a downtrend at start (EMA9 < EMA20, price below VWAP)")
         return None
 
+    def _scalp_reentry(self, sym: str, bars: List[Dict[str, Any]]) -> Optional[Signal]:
+        """Scalp mode, after a target hit: re-enter the same way on a LATER closed bar if the trend still holds
+        (EMA9 vs EMA20 and price vs VWAP agree) and that bar closed back beyond EMA9 (the push resumed)."""
+        side, t_exit = self._reenter[sym]
+        if len(bars) < 30:
+            return None
+        i = len(bars) - 2
+        if bars[i]["t"] <= t_exit:
+            return None                                   # wait for a bar that closed after the exit
+        s = compute_series(bars, [is_rth(b["t"]) for b in bars])
+        e9, e20, vw, c = s.ema9[i], s.ema20[i], s.vwap[i], bars[i]["close"]
+        if None in (e9, e20):
+            return None
+        up = e9 > e20 and (vw is None or c > vw)
+        down = e9 < e20 and (vw is None or c < vw)
+        if (side == "buy" and not up) or (side == "sell" and not down):
+            del self._reenter[sym]                        # trend is gone: wait for a fresh crossover
+            return None
+        if (side == "buy" and c > e9) or (side == "sell" and c < e9):
+            del self._reenter[sym]
+            return Signal(i, side, "trend", f"scalp re-entry: trend still intact (EMA9 {'>' if up else '<'} "
+                                            f"EMA20, price {'above' if up else 'below'} VWAP)")
+        return None
+
     def _new_confluence_signal(self) -> Optional[Signal]:
         """Confluence signal on the minute that JUST closed (all legs aligned), reported once."""
         series = {}
@@ -274,6 +299,10 @@ class TradingBot:
                     sig = self._new_signal(sym, bars)
                     if sig:
                         self._joined.add(sym)          # a real crossover came first; don't also 'join'
+                        self._reenter.pop(sym, None)
+                    elif (self.params.scalp and sym in self._reenter and sym not in self.positions
+                          and in_entry_window(self.limits, now)):
+                        sig = self._scalp_reentry(sym, bars)
                     elif (self.params.join_trend_on_start and sym not in self._joined
                           and in_entry_window(self.limits, now)):
                         sig = self._trend_in_place(sym, bars)
@@ -360,7 +389,14 @@ class TradingBot:
 
     def _dynamic_exit(self, p: Position, sym: str) -> Optional[str]:
         """Trailing stop on the premium (confirmed on 2 consecutive checks) and, once it's armed,
-        a momentum-fade exit on the underlying's last closed bar."""
+        a momentum-fade exit on the underlying's last closed bar. Scalp mode: trend-break exit instead."""
+        if self.params.scalp:
+            bars = self._bars.get(sym) or []
+            if len(bars) < 30:
+                return None
+            i = len(bars) - 2
+            s = compute_series(bars, [is_rth(b["t"]) for b in bars])
+            return trend_break_reason(p.contract, bars[i]["close"], s.ema20[i])
         trail = trail_reason(p.ref, p.mark, p.peak, self.params)
         p.trail_hits = p.trail_hits + 1 if trail else 0
         if trail and p.trail_hits >= 2:
@@ -403,6 +439,12 @@ class TradingBot:
         self.state.realized_pnl += pnl
         self.lifetime_pnl += pnl
         self.positions.pop(p.contract.root, None)
+        root = p.contract.root
+        bars = self._bars.get(root) or []
+        if self.params.scalp and self.params.scalp_reentry and why.startswith("scalp target") and len(bars) >= 2:
+            self._reenter[root] = ("buy" if p.contract.is_call else "sell", bars[-2]["t"])
+        else:
+            self._reenter.pop(root, None)
         self._record_pnl(p, fill, pnl, why)
         self.journal("filled_exit", contract=p.contract.label(), qty=p.qty, entry=p.entry_price, exit=fill, pnl=pnl,
                      reason=why)
